@@ -25,6 +25,7 @@ VALID_PRUNING_METHODS = ("easyep",)
 VALID_BIAS_INITIALIZATIONS = ("gate_token_weighted_mean",)
 VALID_TRAINING_OBJECTIVES = ("layer_mse",)
 VALID_UNOBSERVED_POLICIES = ("exclude", "allow")
+VALID_REPLACEMENT_METHODS = ("bias", "drop", "reroute")
 
 
 class ConfigError(ValueError):
@@ -69,6 +70,7 @@ class ExperimentConfig:
     prune_experts_per_layer: int
     prune_layers: str
     prune_unobserved_policy: str
+    replacement_method: str
     # Bias
     bias_initialization: str
     bias_training_objective: str
@@ -268,6 +270,7 @@ def load_config(
         prune_unobserved_policy=r.choice(
             "PRUNE_UNOBSERVED_POLICY", VALID_UNOBSERVED_POLICIES, "exclude"
         ),
+        replacement_method=r.choice("REPLACEMENT_METHOD", VALID_REPLACEMENT_METHODS, "bias"),
         bias_initialization=r.choice(
             "BIAS_INITIALIZATION", VALID_BIAS_INITIALIZATIONS, "gate_token_weighted_mean"
         ),

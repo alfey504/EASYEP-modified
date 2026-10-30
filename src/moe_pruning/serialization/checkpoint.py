@@ -5,8 +5,8 @@ Format (directory)::
     config.json              original HF model configuration
     generation_config.json   (if present)
     tokenizer files
-    model.safetensors        retained weights + BiasExpert biases; NO weights of replaced experts
-    pruning_manifest.json    which experts were replaced, bias details, tied-weight aliases
+    model.safetensors        retained weights + BiasExpert biases (bias method); NO weights of replaced experts
+    pruning_manifest.json    replaced experts and method per layer, bias details, tied-weight aliases
     experiment_config.json   configuration of the run that produced the checkpoint
     README.md
 
@@ -30,7 +30,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.pruning.bias_expert import BiasExpert
+from moe_pruning.pruning.replacement import make_replacement_module
 from moe_pruning.utils.paths import read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -66,10 +66,25 @@ def deduplicate_state_dict(state: dict[str, torch.Tensor]) -> tuple[dict[str, to
     return tensors, aliases
 
 
+def layer_method(entry: dict) -> str:
+    """Replacement method of a manifest layer entry (older manifests: bias)."""
+    return entry.get("replacement_method", "bias")
+
+
 def replaced_expert_prefixes(manifest: dict) -> list[str]:
     return [
         prefix
         for layer in manifest["layers"].values()
+        for prefix in layer["expert_state_prefixes"].values()
+    ]
+
+
+def expected_bias_keys(manifest: dict) -> list[str]:
+    """State-dict keys that must exist: the biases of bias-replaced experts."""
+    return [
+        prefix + "bias"
+        for layer in manifest["layers"].values()
+        if layer_method(layer) == "bias"
         for prefix in layer["expert_state_prefixes"].values()
     ]
 
@@ -91,7 +106,7 @@ def save_pruned_model(
         for prefix in prefixes:
             if name.startswith(prefix) and name != prefix + "bias":
                 raise CheckpointError(f"Refusing to save original weights of a replaced expert: {name}")
-    missing_biases = [p + "bias" for p in prefixes if p + "bias" not in tensors]
+    missing_biases = [k for k in expected_bias_keys(manifest) if k not in tensors]
     if missing_biases:
         raise CheckpointError(f"Bias parameters missing from the model: {missing_biases}")
 
@@ -121,12 +136,13 @@ def save_pruned_model(
 
 def _default_readme(manifest: dict) -> str:
     lines = [
-        "# Pruned MoE checkpoint (bias-replaced experts)",
+        "# Pruned MoE checkpoint",
         "",
         f"Base model: `{manifest.get('model_source')}`",
         "",
-        "Selected experts were replaced by constant, gate-scaled bias vectors (`BiasExpert`).",
-        "The original weights of replaced experts are **not** stored in this checkpoint.",
+        "Selected experts were removed. Replacement per layer: `bias` = gate-scaled constant vector "
+        "(`BiasExpert`), `drop` = zero output, `reroute` = tokens sent to their best remaining expert.",
+        "The original weights of removed experts are **not** stored in this checkpoint.",
         "",
         "Load with the project's custom loader (plain `from_pretrained` is not supported):",
         "",
@@ -139,7 +155,7 @@ def _default_readme(manifest: dict) -> str:
         "",
     ]
     for layer_id, layer in manifest["layers"].items():
-        lines.append(f"- `{layer_id}`: experts {layer['expert_ids']}")
+        lines.append(f"- `{layer_id}`: experts {layer['expert_ids']} ({layer_method(layer)})")
     return "\n".join(lines) + "\n"
 
 
@@ -164,18 +180,20 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
     with torch.device("meta"):
         model = auto_cls.from_config(config)
 
-    # 2. Install BiasExpert modules in the manifest's expert slots before loading.
+    # 2. Install the replacement modules in the manifest's expert slots before loading.
     adapter = get_adapter(model)
     layers = {layer.layer_id: layer for layer in adapter.discover_layers(model)}
     for layer_id, entry in manifest["layers"].items():
         if layer_id not in layers:
             raise CheckpointError(f"Manifest layer {layer_id} not found in the rebuilt architecture")
         layer = layers[layer_id]
+        method = layer_method(entry)
         for expert_id in entry["expert_ids"]:
             expected_prefix = entry["expert_state_prefixes"][str(expert_id)]
             if adapter.expert_state_prefix(layer, expert_id) != expected_prefix:
                 raise CheckpointError(f"State prefix mismatch for {layer_id} expert {expert_id}")
-            adapter.set_expert(model, layer, expert_id, BiasExpert(layer.expert_output_dim, device="meta"))
+            module = make_replacement_module(method, layer.expert_output_dim, device="meta")
+            adapter.set_expert(model, layer, expert_id, module)
 
     # 3. Load tensors, restoring tied aliases.
     tensors = load_file(str(model_path / WEIGHTS_NAME), device="cpu")
@@ -203,6 +221,9 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
 
     model.to(device)
     model.eval()
+    for layer_id, entry in manifest["layers"].items():
+        if layer_method(entry) == "reroute":
+            adapter.set_routing_mask(model, layers[layer_id], entry["expert_ids"])
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     logger.info(
         "Loaded pruned checkpoint %s (%d replaced experts) on %s",

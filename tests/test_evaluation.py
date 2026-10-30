@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from moe_pruning.data.span_corruption import CorruptedExample
@@ -5,7 +6,7 @@ from moe_pruning.evaluation.evaluator import build_reference_probe, evaluate_mod
 from moe_pruning.evaluation.metrics import per_example_token_nll, prediction_agreement, summarize_losses
 from moe_pruning.model.architecture import get_adapter
 from moe_pruning.model.instrumentation import RecordCollector
-from moe_pruning.pruning.replacement import replace_experts_with_biases
+from moe_pruning.pruning.replacement import replace_experts
 from tests.conftest import make_tiny_model
 
 
@@ -23,7 +24,8 @@ def test_prediction_agreement():
     assert prediction_agreement([[1, 2, 3], [4]], [[1, 0, 3], [4]]) == 0.75
 
 
-def test_reference_probe_measures_true_layer_error():
+@pytest.mark.parametrize("method", ["bias", "drop", "reroute"])
+def test_reference_probe_measures_true_layer_error(method):
     original = make_tiny_model(seed=11)
     adapter = get_adapter(original)
     layers = {layer.layer_id: layer for layer in adapter.discover_layers(original)}
@@ -42,7 +44,8 @@ def test_reference_probe_measures_true_layer_error():
     y_orig = [r.moe_output for r in collector.records]
 
     pruned = make_tiny_model(seed=11)
-    replace_experts_with_biases(pruned, adapter, layers, {layer.layer_id: {0: torch.randn(16), 3: torch.randn(16)}})
+    biases = {layer.layer_id: {0: torch.randn(16), 3: torch.randn(16)}}
+    replace_experts(pruned, adapter, layers, {layer.layer_id: [0, 3]}, method, biases)
     probe = build_reference_probe(
         pruned, adapter, layers, {layer.layer_id: [0, 3]}, original_tensors, torch.device("cpu")
     )

@@ -70,64 +70,79 @@ def prepare_eval_examples(cfg: ExperimentConfig, tokenizer, paths: ArtifactPaths
 @dataclass
 class _ProbeAccumulator:
     tokens: float = 0.0
-    replaced_tokens: float = 0.0
+    affected_tokens: float = 0.0
     sq_error: float = 0.0
+    affected_sq_error: float = 0.0
     original_sq_norm: float = 0.0
-    replaced_original_sq_norm: float = 0.0
+    affected_original_sq_norm: float = 0.0
 
 
 @dataclass
 class ReferenceExpertProbe:
-    """Measures ||y_original - y_replaced||^2 for pruned layers on the evaluation data.
+    """Measures ||y_original - y_pruned||^2 of pruned layers on the evaluation data.
 
-    The original weights of only the replaced experts are kept (a few MB). For
-    a token routed to a replaced expert e, the original contribution would have
-    been g * E_e(x); the model produces g * b_e. All other tokens are identical
-    because the router and retained experts are unchanged. The inputs x are the
+    For every token, the original layer output is recomputed exactly: original
+    routing (any routing mask ignored), original gate, and the original expert.
+    Retained experts are taken from the pruned model (they are unchanged); the
+    removed experts are rebuilt from their original weights, which are the only
+    original weights kept in memory (a few MB per expert).
+
+    This works for every replacement method (bias, drop, reroute). "Affected"
+    tokens are those originally routed to a removed expert. The inputs are the
     pruned model's actual hidden states, so this is the *local* error of each
     layer given its real (possibly already perturbed) input.
     """
 
+    model: nn.Module
     adapter: MoEAdapter
     layers: dict[str, MoELayerInfo]
     reference_experts: dict[str, dict[int, nn.Module]]
     acc: dict[str, _ProbeAccumulator] = field(default_factory=dict)
 
+    @torch.no_grad()
+    def original_layer_output(self, layer: MoELayerInfo, moe_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(y_original [B,S,D] float32, original top-1 expert index [B,S])."""
+        index, gate = self.adapter.route(self.model, layer, moe_input, apply_mask=False)
+        idx, g = index[..., 0], gate[..., 0].float()
+        y = torch.zeros(moe_input.shape, dtype=torch.float32, device=moe_input.device)
+        reference = self.reference_experts[layer.layer_id]
+        for e in range(layer.num_experts):
+            sel = idx == e
+            if not sel.any():
+                continue
+            expert = reference[e] if e in reference else self.adapter.get_expert(self.model, layer, e)
+            x = moe_input[sel].to(next(expert.parameters()).dtype)
+            y[sel] = g[sel, None] * expert(x).float()
+        return y, idx
+
     def __call__(self, record: MoEForwardRecord, token_mask: torch.Tensor) -> None:
+        layer = self.layers[record.layer_id]
         acc = self.acc.setdefault(record.layer_id, _ProbeAccumulator())
-        dim = record.moe_output.shape[-1]
-        valid = token_mask.reshape(-1).to(record.moe_output.device)
-        x = record.moe_input.reshape(-1, dim)[valid].float()
-        y = record.moe_output.reshape(-1, dim)[valid].float()
-        idx = record.expert_index[..., 0].reshape(-1)[valid]
-        g = record.gate[..., 0].reshape(-1)[valid].float()
-        b_out = record.expert_output[..., 0, :].reshape(-1, dim)[valid].float()
-        delta = torch.zeros_like(y)
-        replaced_mask = torch.zeros_like(idx, dtype=torch.bool)
-        with torch.no_grad():
-            for e, expert in self.reference_experts[record.layer_id].items():
-                sel = idx == e
-                if sel.any():
-                    original = expert(x[sel].to(next(expert.parameters()).dtype)).float()
-                    delta[sel] = g[sel, None] * (original - b_out[sel])
-                    replaced_mask |= sel
-        y_orig = y + delta
+        y_orig, orig_idx = self.original_layer_output(layer, record.moe_input)
+        valid = token_mask.to(record.moe_output.device).bool()
+        removed = torch.tensor(sorted(self.reference_experts[layer.layer_id]), device=orig_idx.device)
+        affected = torch.isin(orig_idx, removed) & valid
+        sq = (y_orig - record.moe_output.float()).square().sum(dim=-1)
+        norm = y_orig.square().sum(dim=-1)
         acc.tokens += float(valid.sum())
-        acc.replaced_tokens += float(replaced_mask.sum())
-        acc.sq_error += float(delta.square().sum())
-        acc.original_sq_norm += float(y_orig.square().sum())
-        acc.replaced_original_sq_norm += float(y_orig[replaced_mask].square().sum())
+        acc.affected_tokens += float(affected.sum())
+        acc.sq_error += float(sq[valid].sum())
+        acc.affected_sq_error += float(sq[affected].sum())
+        acc.original_sq_norm += float(norm[valid].sum())
+        acc.affected_original_sq_norm += float(norm[affected].sum())
 
     def summary(self) -> dict:
         out = {}
         for layer_id, a in self.acc.items():
             out[layer_id] = {
                 "tokens": int(a.tokens),
-                "tokens_routed_to_replaced_experts": int(a.replaced_tokens),
+                "tokens_routed_to_replaced_experts": int(a.affected_tokens),
                 "mse_per_token": a.sq_error / max(a.tokens, 1),
                 "relative_error_all_tokens": a.sq_error / a.original_sq_norm if a.original_sq_norm else None,
+                # Error on the tokens originally routed to removed experts. Under reroute,
+                # capacity effects can also change a few other tokens; those count only above.
                 "relative_error_replaced_tokens": (
-                    a.sq_error / a.replaced_original_sq_norm if a.replaced_original_sq_norm else None
+                    a.affected_sq_error / a.affected_original_sq_norm if a.affected_original_sq_norm else None
                 ),
             }
         return out
@@ -151,7 +166,7 @@ def build_reference_probe(
             state = {k[len(prefix):]: v for k, v in original_tensors.items() if k.startswith(prefix)}
             module.load_state_dict(state, strict=True)
             reference.setdefault(layer_id, {})[e] = module.to(device=device, dtype=dtype).eval()
-    return ReferenceExpertProbe(adapter, layers, reference)
+    return ReferenceExpertProbe(model, adapter, layers, reference)
 
 
 # ----------------------------------------------------------------------

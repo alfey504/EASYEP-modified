@@ -1,4 +1,4 @@
-"""Install BiasExpert modules into expert slots, removing the original experts."""
+"""Remove selected experts and install their replacement (bias vector, drop or reroute)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from torch import nn
 
 from moe_pruning.model.architecture import MoEAdapter, MoELayerInfo
 from moe_pruning.pruning.bias_expert import BiasExpert
+from moe_pruning.pruning.zero_expert import ZeroExpert
 
 logger = logging.getLogger(__name__)
 
@@ -45,38 +46,69 @@ class ReplacementReport:
         }
 
 
-def replace_experts_with_biases(
+REPLACEMENT_METHODS = ("bias", "drop", "reroute")
+
+
+def make_replacement_module(
+    method: str,
+    output_dim: int,
+    init: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+) -> nn.Module:
+    """Module installed in a removed expert's slot for the given method."""
+    if method == "bias":
+        return BiasExpert(output_dim, init=init, dtype=dtype, device=device)
+    if method == "drop":
+        return ZeroExpert(output_dim)
+    if method == "reroute":
+        return ZeroExpert(output_dim, must_be_unused=True)
+    raise ValueError(f"Unknown replacement method {method!r}; expected one of {REPLACEMENT_METHODS}")
+
+
+def replace_experts(
     model: nn.Module,
     adapter: MoEAdapter,
     layers: dict[str, MoELayerInfo],
-    biases: dict[str, dict[int, torch.Tensor | None]],
+    selection: dict[str, list[int]],
+    method: str,
+    biases: dict[str, dict[int, torch.Tensor | None]] | None = None,
 ) -> ReplacementReport:
-    """Replace experts in place.
+    """Remove the selected experts in place and install their replacement.
 
-    Args:
-        biases: ``{layer_id: {expert_id: initial bias or None (zeros)}}``.
+    * ``bias``: BiasExpert initialised from ``biases[layer][expert]`` (None = zeros).
+    * ``drop``: parameter-free ZeroExpert; routed tokens get zero MoE output.
+    * ``reroute``: ZeroExpert plus a routing mask sending the tokens to their best
+      remaining expert.
 
-    The original expert modules are dropped from the model so their parameters
-    are freed. Routers are verified to be bit-identical afterwards.
+    The original expert modules are dropped so their parameters are freed.
+    Router weights are verified to be bit-identical afterwards.
     """
+    if method not in REPLACEMENT_METHODS:
+        raise ValueError(f"Unknown replacement method {method!r}")
+    if method == "bias" and biases is None:
+        raise ValueError("The bias method needs initial bias vectors")
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
     report = ReplacementReport(parameters_before=sum(p.numel() for p in model.parameters()))
     router_digests = {
-        layer_id: _module_digest(adapter.get_router(model, layers[layer_id])) for layer_id in biases
+        layer_id: _module_digest(adapter.get_router(model, layers[layer_id])) for layer_id in selection
     }
-    for layer_id, per_expert in biases.items():
+    for layer_id, expert_ids in selection.items():
         layer = layers[layer_id]
-        for expert_id, init in sorted(per_expert.items()):
+        for expert_id in sorted(expert_ids):
             current = adapter.get_expert(model, layer, expert_id)
-            if isinstance(current, BiasExpert):
+            if isinstance(current, (BiasExpert, ZeroExpert)):
                 raise ValueError(f"{layer_id} expert {expert_id} is already replaced")
-            replacement = BiasExpert(layer.expert_output_dim, init=init, dtype=dtype, device=device)
+            init = biases[layer_id].get(expert_id) if method == "bias" else None
+            replacement = make_replacement_module(method, layer.expert_output_dim, init, dtype, device)
             old = adapter.set_expert(model, layer, expert_id, replacement)
             report.removed_parameters += sum(p.numel() for p in old.parameters())
-            report.added_parameters += replacement.bias.numel()
+            report.added_parameters += sum(p.numel() for p in replacement.parameters())
             del old
             report.replaced.setdefault(layer_id, []).append(expert_id)
+        if method == "reroute":
+            adapter.set_routing_mask(model, layer, sorted(expert_ids))
 
     gc.collect()
     if device.type == "mps":
@@ -96,13 +128,25 @@ def replace_experts_with_biases(
                 raise RuntimeError(f"Original parameters still present after replacement: {leftover}")
     report.parameters_after = sum(p.numel() for p in model.parameters())
     logger.info(
-        "Replaced %d expert(s): removed %d parameters, added %d (net %.2f%% of the model)",
+        "Replaced %d expert(s) [%s]: removed %d parameters, added %d (net %.2f%% of the model)",
         sum(len(v) for v in report.replaced.values()),
+        method,
         report.removed_parameters,
         report.added_parameters,
         100.0 * (report.parameters_before - report.parameters_after) / report.parameters_before,
     )
     return report
+
+
+def replace_experts_with_biases(
+    model: nn.Module,
+    adapter: MoEAdapter,
+    layers: dict[str, MoELayerInfo],
+    biases: dict[str, dict[int, torch.Tensor | None]],
+) -> ReplacementReport:
+    """Shorthand for ``replace_experts(..., method="bias")``."""
+    selection = {layer_id: list(per_expert) for layer_id, per_expert in biases.items()}
+    return replace_experts(model, adapter, layers, selection, "bias", biases)
 
 
 def bias_parameters(model: nn.Module) -> dict[str, nn.Parameter]:

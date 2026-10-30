@@ -40,9 +40,14 @@ logger = logging.getLogger("evaluate")
 STAGES = ("original", "before_training", "after_training")
 STAGE_TITLES = {
     "original": "Original model",
-    "before_training": "Bias replacement (before training)",
-    "after_training": "Bias replacement (after training)",
+    "before_training": "Pruned (before training)",
+    "after_training": "Pruned (after bias training)",
 }
+
+
+def _title(stage: str, metrics: dict) -> str:
+    method = metrics.get("replacement_method")
+    return STAGE_TITLES[stage] if not method else f"{STAGE_TITLES[stage]} [{method}]"
 
 
 def _add_args(parser):
@@ -51,6 +56,11 @@ def _add_args(parser):
 
 
 def _model_dir(paths, stage: str):
+    if stage == "after_training" and paths.cfg.replacement_method != "bias":
+        raise SystemExit(
+            f"REPLACEMENT_METHOD={paths.cfg.replacement_method} has no training stage; "
+            "use --stage before_training."
+        )
     if stage == "before_training":
         return paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
     return paths.require(paths.trained_model_dir, "uv run python scripts/train_biases.py")
@@ -65,6 +75,11 @@ def run_stage(stage: str, cfg, paths, examples, settings, tokenizer) -> dict:
         model = loaded.model
     else:
         model, _, manifest = load_pruned_model(_model_dir(paths, stage), device)
+        if manifest.get("replacement_method", "bias") != cfg.replacement_method:
+            raise SystemExit(
+                f"Checkpoint uses REPLACEMENT_METHOD={manifest.get('replacement_method', 'bias')}, "
+                f"config has {cfg.replacement_method}. Re-run replace_experts.py."
+            )
         if manifest["model_source"] != cfg.model_source:
             raise SystemExit(f"Checkpoint was built from {manifest['model_source']}, config uses {cfg.model_source}")
         adapter = get_adapter(model)
@@ -92,6 +107,7 @@ def run_stage(stage: str, cfg, paths, examples, settings, tokenizer) -> dict:
         "eval_settings": settings,
         "model": {"source": cfg.model_source, "checkpoint_stage": manifest["stage"] if manifest else "original"},
         "replaced_experts": {k: v["expert_ids"] for k, v in manifest["layers"].items()} if manifest else {},
+        "replacement_method": manifest.get("replacement_method", "bias") if manifest else None,
         "runtime_seconds": t["seconds"],
         "memory": memory_info(device),
         "environment": environment_info(device),
@@ -145,6 +161,7 @@ def write_comparison(paths, settings) -> None:
             "mean_example_denoising_loss": m["mean_example_denoising_loss"],
             **compare_to_baseline(m, base),
             "layer_reconstruction": m.get("layer_reconstruction"),
+            "title": _title(stage, m),
         }
         if stage != "original":
             pe = torch.load(paths.eval_per_example(stage), weights_only=False)
@@ -181,7 +198,7 @@ def write_comparison(paths, settings) -> None:
         agree = e.get("teacher_forced_top1_agreement_with_original")
         worse = e.get("fraction_examples_worse")
         lines.append(
-            f"| {STAGE_TITLES[stage]} | {e['mean_token_denoising_loss']:.4f} | {e['loss_difference']:+.4f} | "
+            f"| {e['title']} | {e['mean_token_denoising_loss']:.4f} | {e['loss_difference']:+.4f} | "
             f"{e['relative_loss_increase_percent']:+.2f}% | {'-' if agree is None else f'{agree:.4f}'} | "
             f"{'-' if worse is None else f'{100 * worse:.1f}%'} |"
         )
@@ -191,14 +208,15 @@ def write_comparison(paths, settings) -> None:
             "",
             "## Layer output reconstruction on the evaluation set",
             "",
-            "Error of each replaced layer's output vs. the original experts on the same (actual) layer input.",
+            "Error of each pruned layer's output vs. the original layer (original routing, all original "
+            "experts) on the same (actual) layer input.",
             "",
-            "| Stage | Layer | Tokens → replaced | MSE / token | Rel. error (all tokens) | Rel. error (replaced tokens) |",
+            "| Stage | Layer | Tokens originally → removed experts | MSE / token | Rel. error (all tokens) | Rel. error (those tokens) |",
             "|---|---|---|---|---|---|",
         ]
         for stage, layer_id, v in probe_rows:
             lines.append(
-                f"| {STAGE_TITLES[stage]} | {layer_id} | {v['tokens_routed_to_replaced_experts']}/{v['tokens']} | "
+                f"| {summary[stage]['title']} | {layer_id} | {v['tokens_routed_to_replaced_experts']}/{v['tokens']} | "
                 f"{v['mse_per_token']:.3f} | {v['relative_error_all_tokens']:.4f} | "
                 f"{v['relative_error_replaced_tokens']:.4f} |"
             )
@@ -212,7 +230,7 @@ def write_comparison(paths, settings) -> None:
                   f"- **Target:** {row['target']}"]
         for stage in stages:
             if f"prediction_{stage}" in row:
-                lines.append(f"- **{STAGE_TITLES[stage]}:** {row[f'prediction_{stage}']}")
+                lines.append(f"- **{summary[stage]['title']}:** {row[f'prediction_{stage}']}")
         lines.append("")
     paths.eval_comparison_md.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Comparison written to %s", paths.eval_comparison_md)

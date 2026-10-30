@@ -165,10 +165,59 @@ class SwitchTransformersAdapter(MoEAdapter):
         return index.unsqueeze(-1), gate.unsqueeze(-1)
 
     def route(
-        self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor
+        self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor, apply_mask: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        dispatch, probs, _ = self.get_router(model, layer)(moe_input)
+        router = self.get_router(model, layer)
+        previous = getattr(router, "_moe_pruning_mask_disabled", False)
+        router._moe_pruning_mask_disabled = not apply_mask
+        try:
+            dispatch, probs, _ = router(moe_input)
+        finally:
+            router._moe_pruning_mask_disabled = previous
         return self._dispatch_to_index(dispatch, probs)
+
+    # ------------------------------------------------------------------
+    # Routing mask (reroute method)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _masked_routing_hook(router, _args, output):
+        """Re-do the HF top-1 + capacity assignment with masked experts excluded.
+
+        Mirrors SwitchTransformersTop1Router.forward: same float32 softmax, argmax,
+        per-sequence capacity cumsum. The selected expert's gate is its original
+        softmax probability, so tokens whose best expert is not masked keep exactly
+        the original expert and gate. With an empty mask the output is identical
+        to the unmodified router.
+        """
+        masked = getattr(router, "_moe_pruning_masked_experts", ())
+        if not masked or getattr(router, "_moe_pruning_mask_disabled", False):
+            return None
+        _dispatch, _probs, logits = output
+        probs = nn.functional.softmax(logits, dim=-1, dtype=router.dtype).to(router.input_dtype)
+        selectable = probs.clone()
+        selectable[..., list(masked)] = -1.0  # probabilities are >= 0, so masked experts never win
+        index = torch.argmax(selectable, dim=-1)
+        dispatch = nn.functional.one_hot(index, num_classes=router.num_experts)
+        dispatch = dispatch * (torch.cumsum(dispatch, dim=-2) <= router.expert_capacity)
+        gate = probs.gather(-1, index.unsqueeze(-1))
+        return dispatch, gate, logits
+
+    def set_routing_mask(self, model: nn.Module, layer: MoELayerInfo, expert_ids: list[int]) -> None:
+        for e in expert_ids:
+            self._check_expert_id(layer, e)
+        if len(set(expert_ids)) >= layer.num_experts:
+            raise ValueError("Cannot mask every expert of a layer")
+        router = self.get_router(model, layer)
+        router._moe_pruning_masked_experts = tuple(sorted(set(expert_ids)))
+        if expert_ids and getattr(router, "_moe_pruning_mask_handle", None) is None:
+            # prepend=True: runs before any instrumentation hook, which then sees the final routing.
+            router._moe_pruning_mask_handle = router.register_forward_hook(self._masked_routing_hook, prepend=True)
+        elif not expert_ids and getattr(router, "_moe_pruning_mask_handle", None) is not None:
+            router._moe_pruning_mask_handle.remove()
+            router._moe_pruning_mask_handle = None
+
+    def get_routing_mask(self, model: nn.Module, layer: MoELayerInfo) -> list[int]:
+        return list(getattr(self.get_router(model, layer), "_moe_pruning_masked_experts", ()))
 
     def run_moe_layer(self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor) -> torch.Tensor:
         return self.get_moe_module(model, layer)(moe_input)

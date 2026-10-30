@@ -7,6 +7,15 @@ from datetime import datetime, timezone
 from moe_pruning.config import ExperimentConfig
 from moe_pruning.model.architecture import MoEAdapter, MoELayerInfo
 
+REPLACEMENT_DESCRIPTIONS = {
+    "bias": "constant vector b_e; the parent MoE layer multiplies it by the router gate exactly once (g*b)",
+    "drop": "expert removed; tokens routed to it receive zero MoE output (router unchanged)",
+    "reroute": (
+        "expert removed; a routing mask sends its tokens to their best remaining expert, scaled by that "
+        "expert's original router probability (router weights unchanged; other tokens unaffected)"
+    ),
+}
+
 
 def build_pruning_manifest(
     cfg: ExperimentConfig,
@@ -31,21 +40,29 @@ def build_pruning_manifest(
         "experts_per_layer": cfg.prune_experts_per_layer,
         "prune_layers_spec": cfg.prune_layers,
         "unobserved_policy": cfg.prune_unobserved_policy,
-        "bias_initialization": cfg.bias_initialization,
-        "bias_formula": "b_e = sum_t s_t g_{e,t}^2 E_e(h_t) / sum_t s_t g_{e,t}^2 (training split)",
-        "gate_application": "parent MoE layer multiplies BiasExpert output by the router gate exactly once",
+        "replacement_method": cfg.replacement_method,
+        "replacement_description": REPLACEMENT_DESCRIPTIONS[cfg.replacement_method],
+        "bias_initialization": cfg.bias_initialization if cfg.replacement_method == "bias" else None,
+        "bias_formula": (
+            "b_e = sum_t s_t g_{e,t}^2 E_e(h_t) / sum_t s_t g_{e,t}^2 (training split)"
+            if cfg.replacement_method == "bias" else None
+        ),
         "calibration_fingerprint": calibration_fingerprint,
         "replacement": replacement_report,
         "layers": {
             layer_id: {
                 "module_path": layers[layer_id].module_path,
                 "stack": layers[layer_id].stack,
+                "replacement_method": cfg.replacement_method,
                 "num_experts": layers[layer_id].num_experts,
                 "expert_ids": sorted(expert_ids),
                 "expert_state_prefixes": {
                     str(e): adapter.expert_state_prefix(layers[layer_id], e) for e in sorted(expert_ids)
                 },
-                "bias_initialization": {str(e): bias_init.get(layer_id, {}).get(e) for e in sorted(expert_ids)},
+                "bias_initialization": (
+                    {str(e): bias_init.get(layer_id, {}).get(e) for e in sorted(expert_ids)}
+                    if cfg.replacement_method == "bias" else None
+                ),
             }
             for layer_id, expert_ids in selection.items()
         },

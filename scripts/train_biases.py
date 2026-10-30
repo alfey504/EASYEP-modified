@@ -43,6 +43,11 @@ logger = logging.getLogger("train_biases")
 
 def main() -> None:
     _, cfg, paths = bootstrap(__doc__, "train_biases")
+    if cfg.replacement_method != "bias":
+        raise SystemExit(
+            f"REPLACEMENT_METHOD={cfg.replacement_method} has no trainable parameters; nothing to train. "
+            "Evaluate with `scripts/evaluate.py --stage before_training`."
+        )
     device = resolve_device(cfg.device)
     replaced_dir = paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
 
@@ -56,6 +61,8 @@ def main() -> None:
             "The replaced model was built with different calibration data/settings. "
             "Re-run collect_stats.py, score_experts.py and replace_experts.py."
         )
+    if replaced_manifest.get("replacement_method", "bias") != "bias":
+        raise SystemExit("The replaced model was not built with REPLACEMENT_METHOD=bias. Re-run replace_experts.py.")
     if replaced_manifest["model_source"] != cfg.model_source:
         raise SystemExit("The replaced model was built from a different base model.")
     selection = {layer_id: entry["expert_ids"] for layer_id, entry in replaced_manifest["layers"].items()}

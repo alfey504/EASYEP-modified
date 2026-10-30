@@ -125,6 +125,22 @@ Attention scores (STEP's token selection) are **not** used anywhere.
 
 Unobserved experts (no calibration tokens) are marked `observed=false`, ranked last and excluded from selection unless `PRUNE_UNOBSERVED_POLICY=allow`.
 
+## Replacement methods
+
+`REPLACEMENT_METHOD` selects what happens to the experts EASY-EP selects. In all three cases the original expert weights are removed from memory and from the checkpoint, the router's weights are unchanged, and the selection is identical, so the methods can be compared directly.
+
+| Method | Slot module | Tokens routed to a removed expert | Extra parameters | Trainable |
+|---|---|---|---|---|
+| `bias` | `BiasExpert` | output $g\,b_e$ (gate applied once by the parent) | $d$ per expert | yes (`train_biases.py`) |
+| `drop` | `ZeroExpert` | zero MoE output; residual only | 0 | no |
+| `reroute` | `ZeroExpert` (errors if reached) + routing mask | sent to their best remaining expert $e'$, output $p_{e'}E_{e'}(x)$ | 0 | no |
+
+`reroute` is a forward hook on the router (`SwitchTransformersAdapter.set_routing_mask`) that repeats HF's top-1 and capacity assignment with the removed experts excluded. The gate is the new expert's *original* softmax probability (no renormalisation). Tokens whose best expert is kept therefore get exactly the same expert and gate. Rerouted tokens do consume capacity, so they can push other tokens over an expert's 64-token limit. The mask is listed in the manifest and reinstalled by `load_pruned_model`.
+
+For `drop` and `reroute` there is no training stage: evaluate with `--stage before_training`. `export_model.py` exports the replaced model by default.
+
+The evaluation probe recomputes the exact original layer output (original routing, all original experts) for every token, so its layer error is comparable across methods.
+
 ## Bias initialisation
 
 For the training-split tokens $T_e$ routed to expert $e$:
@@ -200,6 +216,7 @@ The loader builds the architecture from `config.json` on the meta device, instal
 | `PRUNE_EXPERTS_PER_LAYER` | Experts replaced in each selected layer. |
 | `PRUNE_LAYERS` | `first`, `all`, or comma-separated ids such as `encoder.block.1,decoder.block.3`. |
 | `PRUNE_UNOBSERVED_POLICY` | `exclude` (default) or `allow`. |
+| `REPLACEMENT_METHOD` | `bias` (default), `drop` or `reroute`; see *Replacement methods*. |
 | `BIAS_INITIALIZATION` | `gate_token_weighted_mean`. |
 | `BIAS_TRAINING_OBJECTIVE` | `layer_mse`. |
 | `BIAS_LEARNING_RATE`, `BIAS_TRAINING_STEPS`, `BIAS_BATCH_SIZE` | Adam settings for bias training. |
@@ -216,7 +233,7 @@ The loader builds the architecture from `config.json` on the meta device, instal
 ## Tests
 
 ```bash
-uv run pytest            # 69 tests; unit tests use a tiny random Switch model on CPU
+uv run pytest            # 78 tests; unit tests use a tiny random Switch model on CPU
 uv run pytest -m integration   # tests on the real google/switch-base-8 (skipped if not cached)
 ```
 
@@ -230,7 +247,8 @@ They cover:
 - **Replacement:** router unchanged, retained experts unchanged, parameters removed.
 - **Training:** only biases trainable, frozen weights unchanged, loss definition, closed form.
 - **Serialization:** removed weights absent, strict loader, output equality.
-- **Evaluation:** the reference probe matches the true layer error.
+- **Replacement methods:** drop zeroes only the removed experts' tokens; reroute sends them to the best remaining expert with the original gate, leaves every other token unchanged and respects capacity; checkpoints round-trip for every method.
+- **Evaluation:** the reference probe matches the true layer error for every method.
 
 ## Reproducibility notes
 

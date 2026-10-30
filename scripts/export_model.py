@@ -1,8 +1,8 @@
 """Export the trained pruned model to PRUNED_MODEL_PATH and verify the export.
 
 The exported checkpoint contains retained experts, all non-MoE weights, the
-original routers and the trained bias vectors - but no weights of replaced
-experts. It can only be loaded with
+original routers and (bias method) the trained bias vectors - but no weights of
+replaced experts. For reroute, the routing mask is restored from the manifest. It can only be loaded with
 ``moe_pruning.serialization.checkpoint.load_pruned_model``.
 
 Verification (sequential, never two models in memory):
@@ -25,6 +25,7 @@ from moe_pruning.data.calibration import prepare_calibration
 from moe_pruning.data.collators import collate_seq2seq
 from moe_pruning.serialization.checkpoint import (
     WEIGHTS_NAME,
+    expected_bias_keys,
     load_pruned_model,
     replaced_expert_prefixes,
     save_pruned_model,
@@ -40,8 +41,9 @@ ATOL = 1e-4
 
 def _add_args(parser):
     parser.add_argument(
-        "--source", choices=("trained", "replaced"), default="trained",
-        help="Export the trained model (default) or the model before bias training.",
+        "--source", choices=("trained", "replaced"), default=None,
+        help="Model to export. Default: trained for REPLACEMENT_METHOD=bias, replaced otherwise "
+        "(drop/reroute have nothing to train).",
     )
 
 
@@ -52,7 +54,8 @@ def _optional(path):
 def main() -> None:
     args, cfg, paths = bootstrap(__doc__, "export_model", _add_args)
     device = resolve_device(cfg.device)
-    if args.source == "trained":
+    source = args.source or ("trained" if cfg.replacement_method == "bias" else "replaced")
+    if source == "trained":
         source_dir = paths.require(paths.trained_model_dir, "uv run python scripts/train_biases.py")
     else:
         source_dir = paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
@@ -84,7 +87,7 @@ def main() -> None:
     with safe_open(str(out_dir / WEIGHTS_NAME), framework="pt") as fh:
         stored = list(fh.keys())
     leaked = [k for k in stored for p in prefixes if k.startswith(p) and k != p + "bias"]
-    biases_present = all(p + "bias" in stored for p in prefixes)
+    biases_present = all(k in stored for k in expected_bias_keys(manifest))
     if leaked or not biases_present:
         raise RuntimeError(f"Export check failed: leaked={leaked} biases_present={biases_present}")
 

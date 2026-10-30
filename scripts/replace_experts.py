@@ -1,9 +1,13 @@
-"""Replace the selected experts with gate-weighted, token-weighted bias vectors.
+"""Remove the selected experts and install their replacement (REPLACEMENT_METHOD).
 
-Loads the original model, initialises b_e = sum s g^2 E / sum s g^2 from the
-collected statistics, installs BiasExpert modules (the original expert weights
-are dropped), verifies routing/gating, and saves the replaced model in the
-custom checkpoint format.
+* bias:    b_e = sum s g^2 E / sum s g^2 from the collected statistics, installed
+           as BiasExpert (the parent layer applies the gate once: g*b).
+* drop:    parameter-free ZeroExpert; routed tokens get zero MoE output.
+* reroute: ZeroExpert + routing mask; tokens go to their best remaining expert.
+
+The original expert weights are dropped in every case. The behaviour is
+verified on a few calibration examples and the model is saved in the custom
+checkpoint format.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.pruning.bias_initialization import initialize_bias
 from moe_pruning.pruning.manifest import build_pruning_manifest
-from moe_pruning.pruning.replacement import replace_experts_with_biases
+from moe_pruning.pruning.replacement import replace_experts
 from moe_pruning.scoring.statistics import load_statistics
 from moe_pruning.serialization.checkpoint import save_pruned_model
 from moe_pruning.utils.cli import bootstrap
@@ -71,27 +75,31 @@ def main() -> None:
             raise SystemExit(f"Layer description of {layer_id} changed since collect_stats.py")
         selection[layer_id] = experts
 
-    # Bias initialisation from the streamed statistics.
+    method = cfg.replacement_method
+    logger.info("Replacement method: %s", method)
+
+    # Bias initialisation from the streamed statistics (bias method only).
     allow_unobserved = cfg.prune_unobserved_policy == "allow"
     biases: dict[str, dict[int, torch.Tensor]] = {}
     init_report: dict[str, dict[int, dict]] = {}
-    for layer_id, experts in selection.items():
-        for e in experts:
-            bias, result = initialize_bias(stats[layer_id], e, allow_unobserved)
-            biases.setdefault(layer_id, {})[e] = bias.float()
-            init_report.setdefault(layer_id, {})[e] = result.to_dict()
-            logger.info(
-                "%s expert %d: %s over %d tokens | ||b||=%.2f | weighted rel. residual=%s | "
-                "gate-weighted rel. residual=%s",
-                layer_id, e, result.method, result.token_count, result.bias_norm,
-                f"{result.weighted_relative_residual:.3f}" if result.weighted_relative_residual is not None else "n/a",
-                f"{result.gate_weighted_relative_residual:.3f}"
-                if result.gate_weighted_relative_residual is not None else "n/a",
-            )
+    if method == "bias":
+        for layer_id, experts in selection.items():
+            for e in experts:
+                bias, result = initialize_bias(stats[layer_id], e, allow_unobserved)
+                biases.setdefault(layer_id, {})[e] = bias.float()
+                init_report.setdefault(layer_id, {})[e] = result.to_dict()
+                logger.info(
+                    "%s expert %d: %s over %d tokens | ||b||=%.2f | weighted rel. residual=%s | "
+                    "gate-weighted rel. residual=%s",
+                    layer_id, e, result.method, result.token_count, result.bias_norm,
+                    f"{result.weighted_relative_residual:.3f}" if result.weighted_relative_residual is not None else "n/a",
+                    f"{result.gate_weighted_relative_residual:.3f}"
+                    if result.gate_weighted_relative_residual is not None else "n/a",
+                )
 
-    report = replace_experts_with_biases(model, adapter, layers, biases)
+    report = replace_experts(model, adapter, layers, selection, method, biases if method == "bias" else None)
 
-    # Probe: replaced slots must output b, gated once by the unchanged router.
+    # Probe the replaced layers on a few calibration examples.
     calib = prepare_calibration(cfg, loaded.tokenizer)
     probe = collate_seq2seq(calib.items[:4], loaded.tokenizer.pad_token_id)
     collector = RecordCollector()
@@ -102,13 +110,33 @@ def main() -> None:
         err = gate_consistency_error(rec)["max_rel_error"]
         if err > 1e-4:
             raise RuntimeError(f"{rec.layer_id}: gate consistency failed after replacement ({err:.2e})")
-        for e in selection[rec.layer_id]:
-            routed = rec.expert_index[..., 0] == e
-            if routed.any():
-                outs = rec.expert_output[..., 0, :][routed]
-                expected = biases[rec.layer_id][e].to(outs.device, outs.dtype).expand_as(outs)
-                torch.testing.assert_close(outs, expected)
-    logger.info("Verified: replaced slots return b_e and the parent applies the gate once")
+        idx = rec.expert_index[..., 0]
+        removed = selection[rec.layer_id]
+        if method == "bias":
+            for e in removed:
+                routed = idx == e
+                if routed.any():
+                    outs = rec.expert_output[..., 0, :][routed]
+                    expected = biases[rec.layer_id][e].to(outs.device, outs.dtype).expand_as(outs)
+                    torch.testing.assert_close(outs, expected)
+        elif method == "drop":
+            for e in removed:
+                routed = idx == e
+                if routed.any() and rec.moe_output[routed].abs().max() != 0:
+                    raise RuntimeError(f"{rec.layer_id}: dropped expert {e} produced a non-zero output")
+        else:  # reroute
+            if any(bool((idx == e).any()) for e in removed):
+                raise RuntimeError(f"{rec.layer_id}: tokens were routed to a removed expert")
+            with torch.no_grad():
+                orig_idx, orig_gate = adapter.route(
+                    model, layers[rec.layer_id], rec.moe_input.to(device), apply_mask=False
+                )
+            orig_idx, orig_gate = orig_idx[..., 0].cpu(), orig_gate[..., 0].cpu()
+            # Tokens whose original expert is kept: same expert and gate (unless now capacity-dropped).
+            kept = (orig_idx >= 0) & ~torch.isin(orig_idx, torch.tensor(removed, device=orig_idx.device)) & (idx >= 0)
+            if not torch.equal(idx[kept], orig_idx[kept]) or not torch.equal(rec.gate[..., 0][kept], orig_gate[kept]):
+                raise RuntimeError(f"{rec.layer_id}: rerouting changed tokens whose expert was not removed")
+    logger.info("Verified replacement behaviour of %d layer(s) (method=%s)", len(collector.records), method)
 
     write_json(paths.bias_initialization_report, init_report)
     manifest = build_pruning_manifest(

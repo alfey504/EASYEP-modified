@@ -94,9 +94,23 @@ class MoEAdapter(ABC):
 
     @abstractmethod
     def route(
-        self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor
+        self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor, apply_mask: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (expert_index [B,S,K], gate [B,S,K]) exactly as used by the layer."""
+        """Return (expert_index [B,S,K], gate [B,S,K]) exactly as used by the layer.
+
+        With ``apply_mask=False`` any routing mask is ignored, giving the
+        original model's routing decisions.
+        """
+
+    @abstractmethod
+    def set_routing_mask(self, model: nn.Module, layer: MoELayerInfo, expert_ids: list[int]) -> None:
+        """Make ``expert_ids`` unreachable: their tokens go to the best remaining expert.
+
+        Router weights are not modified. An empty list removes the mask.
+        """
+
+    @abstractmethod
+    def get_routing_mask(self, model: nn.Module, layer: MoELayerInfo) -> list[int]: ...
 
     @abstractmethod
     def run_moe_layer(self, model: nn.Module, layer: MoELayerInfo, moe_input: torch.Tensor) -> torch.Tensor:
