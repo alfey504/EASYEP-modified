@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment
+.env
+
+# Experiment outputs and caches
+outputs/
+.pytest_cache/
+
+# Generated evaluation data
+data/evaluation/*.jsonl
+data/evaluation/*.json
+
+# macOS
+.DS_Store

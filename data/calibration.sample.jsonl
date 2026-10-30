@@ -1,0 +1,48 @@
+{"human": "How do I reset my password?", "response": "Go to Account Settings, choose Security and select Reset Password. A reset link will be sent to your registered email address."}
+{"human": "I never received the password reset email.", "response": "Check your spam folder first. If it is not there, confirm the email address on your account and request a new link after five minutes."}
+{"human": "How can I track my order?", "response": "Open the Orders page and select the order. The tracking number and the latest carrier status are shown at the top."}
+{"human": "My order arrived damaged. What should I do?", "response": "Please send us a photo of the damaged item and the packaging within 14 days. We will arrange a replacement or a full refund."}
+{"human": "What is your refund policy?", "response": "Unused items can be returned within 30 days for a full refund. Refunds are issued to the original payment method within five business days."}
+{"human": "Can I return an item without the receipt?", "response": "Yes. We can look up the purchase with your order number or the card used for payment."}
+{"human": "How do I cancel my subscription?", "response": "Open Billing, select your plan and choose Cancel Subscription. Access continues until the end of the current billing period."}
+{"human": "I was charged twice this month.", "response": "Sorry about that. Please share the last four digits of the card and the dates of both charges so we can refund the duplicate."}
+{"human": "How do I update my billing address?", "response": "Go to Billing, then Payment Methods, and edit the address associated with your card."}
+{"human": "The app crashes when I open it.", "response": "Please update to the latest version, restart your device and try again. If it still crashes, send us the error code shown on screen."}
+{"human": "What does error code 403 mean?", "response": "Error 403 means your account does not have permission for that action. Ask your workspace administrator to grant access."}
+{"human": "I cannot log in to my account.", "response": "Make sure Caps Lock is off and try resetting your password. If your account is locked, it unlocks automatically after 30 minutes."}
+{"human": "How do I enable two-factor authentication?", "response": "Open Security settings, choose Two-Factor Authentication and scan the QR code with an authenticator app."}
+{"human": "I lost access to my authenticator app.", "response": "Use one of your backup codes to sign in. If you have none, contact support to verify your identity and recover the account."}
+{"human": "How do I change the email on my account?", "response": "Go to Profile, edit the email field and confirm the change from the link sent to the new address."}
+{"human": "Do you offer phone support?", "response": "Phone support is available on business plans from 9 am to 6 pm on weekdays. All other plans can use chat and email."}
+{"human": "How long does shipping take?", "response": "Standard shipping takes three to five business days. Express shipping arrives within one to two business days."}
+{"human": "Can I change my delivery address after ordering?", "response": "You can change the address until the order is packed. Open the order and choose Edit Delivery Address."}
+{"human": "My discount code is not working.", "response": "Check the expiry date and the minimum order value. Codes cannot be combined with other promotions."}
+{"human": "How do I download my invoice?", "response": "Invoices are available on the Billing page. Select the invoice and click Download PDF."}
+{"human": "Is my warranty still valid?", "response": "Products have a two-year warranty from the delivery date. Enter the serial number on the warranty page to check its status."}
+{"human": "How do I file a warranty claim?", "response": "Submit the claim form with the serial number, a description of the fault and the proof of purchase. We reply within two business days."}
+{"human": "The device will not turn on.", "response": "Charge it for at least 30 minutes with the original cable, then hold the power button for ten seconds to force a restart."}
+{"human": "How do I connect the printer to Wi-Fi?", "response": "Press the wireless button on the printer, then select your network in the setup app and enter the password."}
+{"human": "My internet connection keeps dropping.", "response": "Restart the router, move it away from other electronics and check whether the issue happens on a wired connection too."}
+{"human": "How do I delete my account?", "response": "Go to Privacy settings and choose Delete Account. This permanently removes your data after a 14-day grace period."}
+{"human": "Can I export my data?", "response": "Yes. Under Privacy settings choose Export Data and we will email you a download link within 24 hours."}
+{"human": "How do I add a team member?", "response": "Open Team settings, click Invite and enter their email address. They will receive an invitation to join the workspace."}
+{"human": "Why was my payment declined?", "response": "Payments are usually declined because of an expired card, insufficient funds or a bank security check. Please contact your bank or try another card."}
+{"human": "Where can I find the user manual?", "response": "The user manual is available in the help center under Documentation, and as a PDF on the product page."}
+{"human": "How do I open a support ticket?", "response": "Visit the help center, click Contact Us and fill in the form. You will receive a ticket number by email."}
+{"human": "How can I check the status of my support ticket?", "response": "Sign in to the help center and open My Tickets to see the status and the latest replies."}
+{"human": "The website is very slow.", "response": "Try clearing your browser cache or using another browser. You can also check our status page for ongoing incidents."}
+{"human": "Can I upgrade my plan in the middle of the month?", "response": "Yes. The upgrade takes effect immediately and you only pay the prorated difference for the rest of the month."}
+{"human": "Do you ship internationally?", "response": "We ship to more than 40 countries. Import duties and taxes are calculated at checkout."}
+{"human": "How do I unsubscribe from marketing emails?", "response": "Click the unsubscribe link at the bottom of any marketing email, or turn off newsletters in Notification settings."}
+{"human": "The item I received is different from what I ordered.", "response": "We apologise for the mix-up. Please reply with your order number and a photo of the item, and we will send the correct product."}
+{"human": "How do I reset the device to factory settings?", "response": "Open Settings, choose System, then Reset, and confirm Factory Reset. This erases all data on the device."}
+{"human": "My account was hacked.", "response": "Reset your password immediately and enable two-factor authentication. Contact support so we can review recent activity and secure the account."}
+{"human": "Can I get a refund for a digital purchase?", "response": "Digital purchases can be refunded within 14 days if the content has not been downloaded."}
+{"human": "How do I sync my data across devices?", "response": "Sign in with the same account on each device and turn on Sync in the settings menu."}
+{"human": "The battery drains very quickly.", "response": "Lower the screen brightness, close background apps and check the battery usage screen for apps using the most power."}
+{"human": "What payment methods do you accept?", "response": "We accept major credit cards, debit cards, PayPal and bank transfer for annual plans."}
+{"human": "How do I report a bug?", "response": "Use the Report a Problem option in the app menu and include steps to reproduce the issue and a screenshot if possible."}
+{"human": "Can I pause my subscription?", "response": "Yes, subscriptions can be paused for up to three months from the Billing page."}
+{"human": "How do I change the language of the app?", "response": "Open Settings, select Language and choose your preferred language. The app restarts to apply the change."}
+{"human": "My package shows delivered but I did not get it.", "response": "Check with neighbours and your building reception. If it is still missing after 48 hours, contact us and we will open an investigation with the carrier."}
+{"human": "How do I recover a deleted file?", "response": "Deleted files stay in the Trash for 30 days. Open Trash, select the file and choose Restore."}

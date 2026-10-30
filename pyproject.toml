@@ -1,0 +1,39 @@
+[project]
+name = "easy-ep2"
+version = "0.1.0"
+description = "EASY-EP expert selection with gate-weighted bias-vector replacement for MoE models"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.15.0",
+    # Switch Transformer model + T5 tokenizer
+    "transformers>=4.46",
+    "sentencepiece>=0.2.0",
+    "protobuf>=5.28",
+    # Streaming C4 evaluation data
+    "datasets>=3.0",
+    # Custom checkpoint format
+    "safetensors>=0.4.5",
+    # Configuration
+    "python-dotenv>=1.0.1",
+    # Utilities
+    "numpy>=2.1",
+    "tqdm>=4.66",
+    "psutil>=6.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moe_pruning"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
