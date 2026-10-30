@@ -1,8 +1,9 @@
 """Loss and comparison metrics.
 
-The reported loss is the mean per-token cross-entropy of the T5 span-corruption
-(denoising) targets under teacher forcing. It is NOT autoregressive language
-modelling perplexity and must not be reported as such.
+The meaning of the loss is defined by the model's task objective: for
+encoder-decoder models it is the T5 span-corruption denoising loss (not
+perplexity); for causal LMs it is next-token cross-entropy, for which
+perplexity = exp(loss) is also reported.
 """
 
 from __future__ import annotations
@@ -10,32 +11,26 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 
 
-def per_example_token_nll(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sum of token NLL and number of target tokens per example (padding = -100 ignored)."""
-    nll = F.cross_entropy(
-        logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100, reduction="none"
-    ).view(labels.shape)
-    mask = labels != -100
-    return (nll * mask).sum(dim=-1), mask.sum(dim=-1)
-
-
-def summarize_losses(loss_sums: list[float], token_counts: list[int]) -> dict:
+def summarize_losses(loss_sums: list[float], token_counts: list[int], perplexity: bool = False) -> dict:
     total_tokens = sum(token_counts)
     per_example = [s / n for s, n in zip(loss_sums, token_counts) if n > 0]
-    return {
-        "mean_token_denoising_loss": sum(loss_sums) / max(total_tokens, 1),
-        "mean_example_denoising_loss": sum(per_example) / max(len(per_example), 1),
+    mean = sum(loss_sums) / max(total_tokens, 1)
+    out = {
+        "mean_token_loss": mean,
+        "mean_example_loss": sum(per_example) / max(len(per_example), 1),
         "num_examples": len(token_counts),
         "num_target_tokens": total_tokens,
     }
+    if perplexity:
+        out["perplexity"] = math.exp(mean)
+    return out
 
 
 def compare_to_baseline(stage: dict, baseline: dict) -> dict:
-    loss = stage["mean_token_denoising_loss"]
-    base = baseline["mean_token_denoising_loss"]
+    loss = stage["mean_token_loss"]
+    base = baseline["mean_token_loss"]
     return {
         "loss_difference": loss - base,
         "relative_loss_increase_percent": 100.0 * (loss - base) / base if base else math.nan,

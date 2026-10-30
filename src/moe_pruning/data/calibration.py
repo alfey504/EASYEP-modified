@@ -179,8 +179,8 @@ class PreparedCalibration:
         return [it for it in self.items if it.example_id in self.validation_ids]
 
 
-def prepare_calibration(cfg, tokenizer: PreTrainedTokenizerBase) -> PreparedCalibration:
-    """Load, tokenize and split the calibration set as configured.
+def prepare_calibration(cfg, tokenizer: PreTrainedTokenizerBase, task) -> PreparedCalibration:
+    """Load, tokenize (with the model's task objective) and split the calibration set.
 
     The split is used consistently by every stage: EASY-EP importance uses all
     examples, bias initialisation and training use only the training split, and
@@ -189,7 +189,7 @@ def prepare_calibration(cfg, tokenizer: PreTrainedTokenizerBase) -> PreparedCali
     from moe_pruning.utils.paths import file_sha256, fingerprint
 
     records, report = load_calibration_records(cfg.calibration_dataset_path, cfg.calibration_max_samples)
-    items = tokenize_calibration(records, tokenizer, cfg.max_source_length, cfg.max_target_length)
+    items = task.tokenize_calibration(records, tokenizer, cfg.max_source_length, cfg.max_target_length)
     train, val = split_train_validation(items, cfg.bias_validation_fraction, cfg.seed)
     metadata = {
         "path": str(cfg.calibration_dataset_path),
@@ -202,8 +202,9 @@ def prepare_calibration(cfg, tokenizer: PreTrainedTokenizerBase) -> PreparedCali
         "split_seed": cfg.seed,
         "max_source_length": cfg.max_source_length,
         "max_target_length": cfg.max_target_length,
-        "encoder_tokens": sum(len(it.input_ids) for it in items),
-        "decoder_tokens": sum(len(it.labels) for it in items),
+        "task": task.name,
+        "input_tokens": sum(len(it.input_ids) for it in items),
+        "target_tokens": sum(sum(1 for t in it.labels if t != -100) for it in items),
     }
     metadata["fingerprint"] = fingerprint({k: v for k, v in metadata.items() if k != "path"})
     return PreparedCalibration(

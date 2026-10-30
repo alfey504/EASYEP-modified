@@ -90,23 +90,24 @@ def replace_experts(
         raise ValueError("The bias method needs initial bias vectors")
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
+    if dtype in (torch.float16, torch.bfloat16):
+        dtype = torch.float32  # keep trainable bias vectors in full precision
     report = ReplacementReport(parameters_before=sum(p.numel() for p in model.parameters()))
     router_digests = {
         layer_id: _module_digest(adapter.get_router(model, layers[layer_id])) for layer_id in selection
     }
     for layer_id, expert_ids in selection.items():
         layer = layers[layer_id]
+        modules: dict[int, nn.Module] = {}
         for expert_id in sorted(expert_ids):
             current = adapter.get_expert(model, layer, expert_id)
             if isinstance(current, (BiasExpert, ZeroExpert)):
                 raise ValueError(f"{layer_id} expert {expert_id} is already replaced")
             init = biases[layer_id].get(expert_id) if method == "bias" else None
-            replacement = make_replacement_module(method, layer.expert_output_dim, init, dtype, device)
-            old = adapter.set_expert(model, layer, expert_id, replacement)
-            report.removed_parameters += sum(p.numel() for p in old.parameters())
-            report.added_parameters += sum(p.numel() for p in replacement.parameters())
-            del old
-            report.replaced.setdefault(layer_id, []).append(expert_id)
+            modules[expert_id] = make_replacement_module(method, layer.expert_output_dim, init, dtype, device)
+        report.removed_parameters += adapter.replace_experts_in_layer(model, layer, modules)
+        report.added_parameters += sum(p.numel() for m in modules.values() for p in m.parameters())
+        report.replaced[layer_id] = sorted(expert_ids)
         if method == "reroute":
             adapter.set_routing_mask(model, layer, sorted(expert_ids))
 
@@ -119,13 +120,17 @@ def replace_experts(
     for layer_id, digest in router_digests.items():
         if _module_digest(adapter.get_router(model, layers[layer_id])) != digest:
             raise RuntimeError(f"Router of {layer_id} changed during replacement")
-    state_keys = model.state_dict().keys()
-    for layer_id, expert_ids in report.replaced.items():
-        for expert_id in expert_ids:
-            prefix = adapter.expert_state_prefix(layers[layer_id], expert_id)
-            leftover = [k for k in state_keys if k.startswith(prefix) and k != prefix + "bias"]
-            if leftover:
-                raise RuntimeError(f"Original parameters still present after replacement: {leftover}")
+    shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    for layer_id in report.replaced:
+        layer = layers[layer_id]
+        # All experts removed from the layer so far (this call and earlier ones).
+        all_removed = [
+            e for e in range(layer.num_experts)
+            if isinstance(adapter.get_expert(model, layer, e), (BiasExpert, ZeroExpert))
+        ]
+        leftover = adapter.removed_weight_violations(shapes, layer, all_removed)
+        if leftover:
+            raise RuntimeError(f"Original parameters still present after replacement: {leftover}")
     report.parameters_after = sum(p.numel() for p in model.parameters())
     logger.info(
         "Replaced %d expert(s) [%s]: removed %d parameters, added %d (net %.2f%% of the model)",

@@ -9,12 +9,21 @@ from tests.conftest import make_tiny_model
 def test_shape_dtype_device_and_gradients():
     init = torch.arange(4, dtype=torch.float32)
     expert = BiasExpert(4, init=init, dtype=torch.float64)
-    out = expert(torch.randn(3, 5, 7))  # input width may differ from output width
+    assert expert.bias.dtype == torch.float64
+    out = expert(torch.randn(3, 5, 7, dtype=torch.float64))  # input width may differ from output width
     assert out.shape == (3, 5, 4)
     assert out.dtype == torch.float64 and out.device == expert.bias.device
     torch.testing.assert_close(out[2, 4], init.double())
     out.sum().backward()
     torch.testing.assert_close(expert.bias.grad, torch.full((4,), 15.0, dtype=torch.float64))
+
+
+def test_half_precision_output_with_float32_parameter():
+    expert = BiasExpert(4, init=torch.tensor([1.0, 1e-4, 2.0, 3.0]))
+    out = expert(torch.randn(2, 4, dtype=torch.bfloat16))
+    assert out.dtype == torch.bfloat16 and expert.bias.dtype == torch.float32
+    out.float().sum().backward()
+    assert expert.bias.grad.dtype == torch.float32
     assert isinstance(expert.bias, torch.nn.Parameter)
 
 

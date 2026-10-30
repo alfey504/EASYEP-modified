@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from moe_pruning.config import ExperimentConfig
 from moe_pruning.utils.device import check_dtype_supported, log_device, resolve_device, resolve_dtype
@@ -28,6 +28,7 @@ class LoadedModel:
     dtype: torch.dtype
     source: str
     revision: str | None
+    plugin: object  # moe_pruning.models.ModelPlugin
 
 
 def _source(cfg: ExperimentConfig) -> tuple[str, str | None]:
@@ -39,7 +40,19 @@ def _source(cfg: ExperimentConfig) -> tuple[str, str | None]:
 
 def load_tokenizer(cfg: ExperimentConfig) -> PreTrainedTokenizerBase:
     source, revision = _source(cfg)
-    return AutoTokenizer.from_pretrained(source, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(source, revision=revision)
+    if tokenizer.pad_token_id is None:
+        # Right padding is always masked out; any id works, EOS is the usual choice.
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def get_model_plugin(cfg: ExperimentConfig):
+    """Model plugin of the configured model (reads only its config.json)."""
+    from moe_pruning.models import plugin_for_source
+
+    source, revision = _source(cfg)
+    return plugin_for_source(source, revision)
 
 
 def load_original_model(cfg: ExperimentConfig, device: torch.device | None = None) -> LoadedModel:
@@ -52,50 +65,83 @@ def load_original_model(cfg: ExperimentConfig, device: torch.device | None = Non
 
     origin = "local directory" if cfg.model_path else "Hugging Face Hub"
     logger.info("Loading model %s from %s (revision=%s)", source, origin, revision or "default")
-    hf_config = AutoConfig.from_pretrained(source, revision=revision)
-    auto_cls = AutoModelForSeq2SeqLM if hf_config.is_encoder_decoder else AutoModelForCausalLM
-    model = auto_cls.from_pretrained(source, revision=revision, dtype=dtype)
+    plugin = get_model_plugin(cfg)
+    logger.info("Model plugin: %s (%s)", plugin.name, plugin.description)
+    model = plugin.auto_model_class.from_pretrained(source, revision=revision, dtype=dtype)
     model.to(device)
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(source, revision=revision)
+    tokenizer = load_tokenizer(cfg)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Loaded %s with %.1fM parameters", type(model).__name__, n_params / 1e6)
-    return LoadedModel(model, tokenizer, device, dtype, source, revision)
+    return LoadedModel(model, tokenizer, device, dtype, source, revision, plugin)
 
 
-def load_original_tensors(cfg: ExperimentConfig, prefixes: list[str]) -> dict[str, torch.Tensor]:
-    """Read only the tensors whose names start with one of ``prefixes`` from the
-    original checkpoint (memory-mapped; the full model is never materialised).
+class CheckpointReader:
+    """Lazy, memory-mapped access to the tensors of the ORIGINAL checkpoint on disk.
 
-    Used to measure the reconstruction error of replaced experts without
-    keeping a second copy of the model in memory.
+    Reads safetensors shards (``*.safetensors``) or PyTorch ``pytorch_model*.bin``
+    files. Tensor names are those stored on disk, which may differ from the
+    in-memory module names (e.g. transformers 5 fuses OLMoE experts on load);
+    adapters translate in ``MoEAdapter.load_original_expert``.
     """
-    from pathlib import Path
 
+    def __init__(self, model_dir: Path):
+        from safetensors import safe_open
+
+        self.model_dir = Path(model_dir)
+        self._handles = []
+        self._where: dict[str, object] = {}
+        files = sorted(self.model_dir.glob("*.safetensors"))
+        if files:
+            for path in files:
+                handle = safe_open(str(path), framework="pt")
+                self._handles.append(handle)
+                for name in handle.keys():
+                    self._where[name] = handle
+        else:
+            for path in sorted(self.model_dir.glob("pytorch_model*.bin")):
+                state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+                self._handles.append(state)
+                for name in state:
+                    self._where[name] = state
+        if not self._where:
+            raise FileNotFoundError(f"No checkpoint files (*.safetensors / pytorch_model*.bin) in {self.model_dir}")
+
+    def keys(self) -> list[str]:
+        return list(self._where)
+
+    def has(self, name: str) -> bool:
+        return name in self._where
+
+    def get(self, name: str) -> torch.Tensor:
+        source = self._where[name]
+        if isinstance(source, dict):
+            return source[name].clone()
+        return source.get_tensor(name)
+
+
+def open_original_checkpoint(cfg: ExperimentConfig) -> CheckpointReader:
+    """CheckpointReader for the configured original model (local dir or HF cache)."""
     from huggingface_hub import snapshot_download
-    from safetensors import safe_open
 
     source, revision = _source(cfg)
     if cfg.model_path:
-        model_dir = Path(cfg.model_path)
-    else:
-        model_dir = Path(
-            snapshot_download(source, revision=revision, allow_patterns=["*.safetensors", "*.bin", "*.json"])
-        )
-    wanted = lambda name: any(name.startswith(p) for p in prefixes)  # noqa: E731
-    out: dict[str, torch.Tensor] = {}
-    safetensor_files = sorted(model_dir.glob("*.safetensors"))
-    if safetensor_files:
-        for path in safetensor_files:
-            with safe_open(str(path), framework="pt") as fh:
-                for name in fh.keys():
-                    if wanted(name):
-                        out[name] = fh.get_tensor(name)
-    else:
-        for path in sorted(model_dir.glob("pytorch_model*.bin")):
-            state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-            out.update({k: v.clone() for k, v in state.items() if wanted(k)})
-            del state
-    if not out:
-        raise FileNotFoundError(f"No tensors with prefixes {prefixes} found in {model_dir}")
-    return out
+        return CheckpointReader(Path(cfg.model_path))
+    model_dir = snapshot_download(source, revision=revision, allow_patterns=["*.safetensors", "*.bin", "*.json"])
+    return CheckpointReader(Path(model_dir))
+
+
+class StateDictReader:
+    """CheckpointReader over an in-memory state dict (tests, already-loaded weights)."""
+
+    def __init__(self, state: dict[str, torch.Tensor]):
+        self._state = state
+
+    def keys(self) -> list[str]:
+        return list(self._state)
+
+    def has(self, name: str) -> bool:
+        return name in self._state
+
+    def get(self, name: str) -> torch.Tensor:
+        return self._state[name].clone()

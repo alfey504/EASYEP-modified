@@ -15,9 +15,11 @@ upstream changes alter downstream hidden states and routing, which the
 per-layer objective does not see.
 
 Because routing is fixed for the cached inputs, the objective is quadratic in
-each bias with the closed-form minimiser :math:`b^*_e = \sum g^2E / \sum g^2`
-over the training tokens routed to :math:`e` (no token-contribution weight).
-It is reported as a reference for the optimiser.
+the biases. With top-1 routing it separates per expert, with the closed-form
+minimiser :math:`b^*_e = \sum g^2E / \sum g^2` over the training tokens routed
+to :math:`e` (no token-contribution weight), reported as a reference for the
+optimiser. With top-k routing (k > 1) the biases are coupled and no closed form
+is reported.
 """
 
 from __future__ import annotations
@@ -266,8 +268,12 @@ def train_layer_biases(
     def evaluate(rows):
         return evaluate_reconstruction(model, adapter, layer, ref, rows, device, eval_bs) if rows else float("nan")
 
-    # Closed-form reference (does not modify the model).
-    closed = closed_form_biases(model, adapter, layer, ref, train_rows, expert_ids, device, eval_bs)
+    # Closed-form reference (does not modify the model). Only for top-1 routing: with
+    # top-k a token can mix several replaced experts, which couples their biases.
+    if layer.top_k == 1:
+        closed = closed_form_biases(model, adapter, layer, ref, train_rows, expert_ids, device, eval_bs)
+    else:
+        closed = {e: None for e in expert_ids}
     closed_train = closed_val = None
     if all(v is not None for v in closed.values()):
         with torch.no_grad():

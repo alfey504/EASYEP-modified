@@ -1,7 +1,8 @@
 """Collect EASY-EP statistics for every sparse MoE layer of the original model.
 
-Encoder layers see the ``human`` text; decoder layers see the teacher-forced
-``response``. Padding tokens are excluded. Statistics are streamed into float64
+Inputs are built by the model plugin's task: encoder-decoder models see the
+``human`` text in the encoder and the teacher-forced ``response`` in the
+decoder; causal models see prompt + response. Padding tokens are excluded. Statistics are streamed into float64
 accumulators (no per-token activations are stored).
 """
 
@@ -14,9 +15,8 @@ import torch
 from tqdm import tqdm
 
 from moe_pruning.data.calibration import prepare_calibration
-from moe_pruning.data.collators import iter_batches
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.instrumentation import gate_consistency_error
+from moe_pruning.model.instrumentation import gate_consistency_error, gate_consistency_tolerance
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.scoring.statistics import ExpertStatisticsAccumulator
 from moe_pruning.utils.cli import bootstrap
@@ -34,11 +34,12 @@ def main() -> None:
     layers = adapter.discover_layers(model)
     stack_of = {layer.layer_id: layer.stack for layer in layers}
 
-    calib = prepare_calibration(cfg, loaded.tokenizer)
+    task = loaded.plugin.task()
+    calib = prepare_calibration(cfg, loaded.tokenizer, task)
     logger.info(
-        "Calibration: %d examples (%d train / %d validation), %d encoder + %d decoder tokens",
+        "Calibration: %d examples (%d train / %d validation), %d input + %d target tokens",
         calib.metadata["num_examples"], calib.metadata["num_train"], calib.metadata["num_validation"],
-        calib.metadata["encoder_tokens"], calib.metadata["decoder_tokens"],
+        calib.metadata["input_tokens"], calib.metadata["target_tokens"],
     )
 
     acc = ExpertStatisticsAccumulator(layers)
@@ -55,19 +56,19 @@ def main() -> None:
 
     total_loss = 0.0
     total_tokens = 0
-    batches = list(iter_batches(calib.items, cfg.calibration_batch_size, loaded.tokenizer.pad_token_id))
+    batches = list(task.iter_batches(calib.items, cfg.calibration_batch_size, loaded.tokenizer.pad_token_id))
     with timed() as t, torch.no_grad(), adapter.instrument(model, layers, on_record):
         for batch in tqdm(batches, desc="collecting statistics", unit="batch"):
             current["masks"] = batch.token_masks(device)
             current["train_rows"] = torch.tensor(
                 [eid in calib.train_ids for eid in batch.example_ids], device=device
             )
-            out = model(**batch.model_inputs(device))
-            n = int(current["masks"]["decoder"].sum())
-            total_loss += float(out.loss) * n
-            total_tokens += n
+            inputs = batch.model_inputs(device)
+            loss_sum, n_tok = task.token_nll(model(**inputs).logits, inputs["labels"])
+            total_loss += float(loss_sum.sum())
+            total_tokens += int(n_tok.sum())
 
-    if max_gate_err > 1e-4:
+    if max_gate_err > gate_consistency_tolerance(loaded.dtype):
         raise RuntimeError(f"Gate consistency check failed during collection (rel. error {max_gate_err:.2e})")
 
     paths.expert_stats.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +76,8 @@ def main() -> None:
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_source": loaded.source,
+        "model_plugin": loaded.plugin.name,
+        "task": task.name,
         "revision": loaded.revision,
         "dtype": cfg.model_dtype,
         "layers": [layer.to_dict() for layer in layers],

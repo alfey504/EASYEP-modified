@@ -34,7 +34,6 @@ from moe_pruning.model.architecture import (
     MoEForwardRecord,
     MoELayerInfo,
     RecordCallback,
-    register_adapter,
 )
 
 
@@ -53,10 +52,7 @@ def _is_sparse_mlp(module: nn.Module) -> bool:
     )
 
 
-@register_adapter
 class SwitchTransformersAdapter(MoEAdapter):
-    model_types = ("switch_transformers",)
-
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------

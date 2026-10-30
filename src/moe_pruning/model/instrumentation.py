@@ -54,3 +54,15 @@ class RecordCollector:
         for record in self.records:
             out.setdefault(record.layer_id, []).append(record)
         return out
+
+
+def gate_consistency_tolerance(dtype: torch.dtype) -> float:
+    """Relative tolerance for ``gate_consistency_error`` at the model's precision.
+
+    Recomputed expert outputs are summed in a different order than the model's
+    kernel, so the two agree only to the dtype's rounding level (bfloat16 has
+    ~3 significant digits).
+    """
+    if dtype in (torch.float16, torch.bfloat16):
+        return 3e-2
+    return 1e-4

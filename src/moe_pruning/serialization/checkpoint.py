@@ -21,15 +21,17 @@ so it is deliberately not supported.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
-from moe_pruning.model.architecture import get_adapter
+from moe_pruning.model.architecture import MoEAdapter, get_adapter
+from moe_pruning.models import get_plugin
 from moe_pruning.pruning.replacement import make_replacement_module
 from moe_pruning.utils.paths import read_json, write_json
 
@@ -89,6 +91,48 @@ def expected_bias_keys(manifest: dict) -> list[str]:
     ]
 
 
+@contextmanager
+def parameters_on_meta():
+    """Create parameters on the meta device but buffers normally.
+
+    Parameters are filled from the checkpoint, so allocating/initialising them
+    would waste time and memory. Non-persistent buffers (e.g. rotary
+    ``inv_freq`` in OLMoE) are not stored in checkpoints and must be computed
+    from the config as usual, so they stay on the CPU.
+    """
+    original = nn.Module.register_parameter
+
+    def register_parameter(module, name, param):
+        if param is not None and not param.is_meta:
+            param = nn.Parameter(param.to("meta"), requires_grad=param.requires_grad)
+        original(module, name, param)
+
+    nn.Module.register_parameter = register_parameter
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = original
+
+
+def removed_weight_violations(
+    adapter: MoEAdapter, model: nn.Module, state_shapes: dict[str, tuple[int, ...]], manifest: dict
+) -> list[str]:
+    """Stored tensors (by name/shape) that hold weights of experts the manifest lists as removed."""
+    layers = {layer.layer_id: layer for layer in adapter.discover_layers(model)}
+    bad: list[str] = []
+    for layer_id, entry in manifest["layers"].items():
+        bad += adapter.removed_weight_violations(state_shapes, layers[layer_id], entry["expert_ids"])
+    return bad
+
+
+def stored_tensor_shapes(path: Path) -> dict[str, tuple[int, ...]]:
+    """Name -> shape of every tensor in a safetensors file, without loading data."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as fh:
+        return {name: tuple(fh.get_slice(name).get_shape()) for name in fh.keys()}
+
+
 def save_pruned_model(
     model: nn.Module,
     tokenizer,
@@ -101,11 +145,10 @@ def save_pruned_model(
     output_dir.mkdir(parents=True, exist_ok=True)
     tensors, aliases = deduplicate_state_dict(model.state_dict())
 
-    prefixes = replaced_expert_prefixes(manifest)
-    for name in tensors:
-        for prefix in prefixes:
-            if name.startswith(prefix) and name != prefix + "bias":
-                raise CheckpointError(f"Refusing to save original weights of a replaced expert: {name}")
+    adapter = get_adapter(model)
+    violations = removed_weight_violations(adapter, model, {k: tuple(t.shape) for k, t in tensors.items()}, manifest)
+    if violations:
+        raise CheckpointError(f"Refusing to save original weights of replaced experts: {violations}")
     missing_biases = [k for k in expected_bias_keys(manifest) if k not in tensors]
     if missing_biases:
         raise CheckpointError(f"Bias parameters missing from the model: {missing_biases}")
@@ -176,9 +219,9 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
 
     # 1. Architecture from the saved configuration, without allocating weights.
     config = AutoConfig.from_pretrained(model_path)
-    auto_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
-    with torch.device("meta"):
-        model = auto_cls.from_config(config)
+    plugin = get_plugin(config.model_type)
+    with parameters_on_meta():
+        model = plugin.auto_model_class.from_config(config)
 
     # 2. Install the replacement modules in the manifest's expert slots before loading.
     adapter = get_adapter(model)
@@ -188,12 +231,13 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
             raise CheckpointError(f"Manifest layer {layer_id} not found in the rebuilt architecture")
         layer = layers[layer_id]
         method = layer_method(entry)
+        modules = {}
         for expert_id in entry["expert_ids"]:
             expected_prefix = entry["expert_state_prefixes"][str(expert_id)]
             if adapter.expert_state_prefix(layer, expert_id) != expected_prefix:
                 raise CheckpointError(f"State prefix mismatch for {layer_id} expert {expert_id}")
-            module = make_replacement_module(method, layer.expert_output_dim, device="meta")
-            adapter.set_expert(model, layer, expert_id, module)
+            modules[expert_id] = make_replacement_module(method, layer.expert_output_dim, device="meta")
+        adapter.replace_experts_in_layer(model, layer, modules)
 
     # 3. Load tensors, restoring tied aliases.
     tensors = load_file(str(model_path / WEIGHTS_NAME), device="cpu")
@@ -212,6 +256,11 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
             f"State dict mismatch.\n  missing ({len(missing)}): {missing[:10]}\n"
             f"  unexpected ({len(unexpected)}): {unexpected[:10]}"
         )
+    expected_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    wrong = [f"{k}: stored {tuple(tensors[k].shape)}, expected {expected_shapes[k]}"
+             for k in expected_shapes if tuple(tensors[k].shape) != expected_shapes[k]]
+    if wrong:
+        raise CheckpointError(f"Tensor shape mismatch: {wrong[:10]}")
     model.load_state_dict(tensors, strict=True, assign=True)
     model.tie_weights()
 
@@ -221,6 +270,7 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
 
     model.to(device)
     model.eval()
+    adapter.validate_loaded(model, [layers[layer_id] for layer_id in manifest["layers"]])
     for layer_id, entry in manifest["layers"].items():
         if layer_method(entry) == "reroute":
             adapter.set_routing_mask(model, layers[layer_id], entry["expert_ids"])

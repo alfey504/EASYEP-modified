@@ -5,9 +5,16 @@ Research code that combines
 * **EASY-EP** ([paper](https://arxiv.org/abs/2504.06792), [code](https://github.com/RUCAIBox/EASYEP)) – output-aware expert importance × expert-level token contribution – to pick the least important experts of a Mixture-of-Experts layer, with
 * **STEP-style replacement** ([adaptation](https://github.com/alfey504/STEP-adapted)) – instead of deleting those experts, each is replaced by a trainable constant vector $b_e$ that the *unchanged* router still scales by its gate: $\hat y_{e,t} = g_{e,t}\, b_e$.
 
-Research question: *can EASY-EP identify experts that can be replaced with gate-weighted bias vectors while preserving the original model's behaviour?* The pipeline measures this directly (layer reconstruction error and end-to-end denoising loss) rather than assuming it.
+Research question: *can EASY-EP identify experts that can be replaced with gate-weighted bias vectors while preserving the original model's behaviour?* The pipeline measures this directly (layer reconstruction error and end-to-end loss) rather than assuming it.
 
-The first target is `google/switch-base-8` (encoder–decoder Switch Transformer, 8 experts, top-1 routing) on an Apple-silicon Mac (MPS, 16 GB).
+Supported models (each is a separate plugin, see [Model plugins](#model-plugins)):
+
+| Plugin | Model | Architecture | Profile |
+|---|---|---|---|
+| `switch_transformers` | `google/switch-base-8` | encoder–decoder, 12 MoE layers × 8 experts, top-1, capacity 64 | `configs/switch-base-8.env` |
+| `olmoe` | `allenai/OLMoE-1B-7B-0125` (the model used in STEP) | decoder-only, 16 MoE layers × 64 experts, top-8 | `configs/olmoe-1b-7b-0125.env` |
+
+switch-base-8 runs on an Apple-silicon Mac (MPS, 16 GB). OLMoE-1B-7B (6.9B parameters, ~14 GB in bfloat16) needs a GPU with ≥ 24 GB.
 
 See [docs/sample_experiment_report.md](docs/sample_experiment_report.md) for results of a first run.
 
@@ -30,7 +37,15 @@ Put your calibration data at `CALIBRATION_DATASET_PATH` (default `./data/calibra
 
 ## Workflow
 
-Every step is a separate script that reads `.env`, validates its input artifacts and writes its own outputs to `EXPERIMENT_DIR/EXPERIMENT_NAME/`. Any value can be overridden for one run with `--set KEY=VALUE` (repeatable), e.g. `--set PRUNE_EXPERTS_PER_LAYER=3`.
+Every step is a separate script that reads `.env`, validates its input artifacts and writes its own outputs to `EXPERIMENT_DIR/EXPERIMENT_NAME/`. Configuration is layered: `.env` < `--profile configs/<model>.env` (or `MOE_PROFILE`) < environment variables < `--set KEY=VALUE` (repeatable), e.g. `--set PRUNE_EXPERTS_PER_LAYER=3`. Each profile sets its own `EXPERIMENT_NAME` and `PRUNED_MODEL_PATH`, so the models' results never mix.
+
+```bash
+# same commands for both models; pick the profile
+uv run python scripts/collect_stats.py --profile configs/switch-base-8.env
+uv run python scripts/collect_stats.py --profile configs/olmoe-1b-7b-0125.env
+```
+
+Full sequence:
 
 ```bash
 uv run python scripts/inspect_model.py                         # architecture report + gate-application probe
@@ -67,25 +82,77 @@ uv run python scripts/export_model.py                          # compact checkpo
 ## Architecture overview
 
 ```
+configs/                    per-model profiles layered on top of .env
 src/moe_pruning/
-  config.py                 .env loading, validation, --set overrides
+  config.py                 .env + profile loading, validation, --set overrides
+  models/                   MODEL PLUGINS (everything model-specific)
+    __init__.py             registry: ModelPlugin, register_plugin, get_plugin, MODEL_PLUGINS
+    switch_transformers/    adapter.py (Switch routing, capacity, per-expert modules)
+    olmoe/                  adapter.py (top-k router, masking), experts.py (PrunedFusedExperts)
+  tasks/                    objectives chosen by plugins
+    seq2seq_denoising.py    human->encoder, response->decoder; T5 span-corruption evaluation
+    causal_lm.py            prompt+response; next-token evaluation (+ perplexity)
   model/
     architecture.py         MoEAdapter interface, MoELayerInfo, MoEForwardRecord, layer selection
-    switch_adapter.py       Switch Transformers adapter (all HF-specific code lives here)
     instrumentation.py      gate-consistency checks, record collector
-    loader.py               original model / tokenizer loading, partial original-weight reads
-  data/                     calibration JSONL, collators (right padding), span corruption, C4 filter
-  scoring/                  easyep.py (formulas), statistics.py (streaming accumulators)
-  pruning/                  bias_expert.py, bias_initialization.py, expert_selection.py, replacement.py, manifest.py
-  training/bias_trainer.py  reference capture, layer-MSE training, closed-form reference
-  evaluation/               evaluator (+ reference-expert probe), metrics
+    loader.py               plugin-based model/tokenizer loading, CheckpointReader (original weights)
+  data/                     calibration JSONL, collators (right padding, per-stack masks), span corruption, C4 filter
+  scoring/                  easyep.py (formulas), statistics.py (streaming accumulators, top-k)
+  pruning/                  bias_expert.py, zero_expert.py, bias_initialization.py, expert_selection.py,
+                            replacement.py, manifest.py
+  training/bias_trainer.py  reference capture, layer-MSE training, closed-form reference (top-1)
+  evaluation/               evaluator (+ exact reference probe), metrics
   serialization/checkpoint.py  custom safetensors format, load_pruned_model
   utils/                    device, logging, reproducibility, paths, cli
 ```
 
-All algorithms talk to the model only through `MoEAdapter` (discover layers, get router/experts, route, run one MoE layer, replace an expert, instrument a forward pass). A forward pass yields, per layer, an `MoEForwardRecord` with the residual stream, MoE input/output, expert indices, gates and *un-gated* expert outputs. Supporting OLMoE means writing one new adapter.
+The scoring, initialisation, replacement, training, evaluation and serialization code is model-agnostic. It talks to a model only through its plugin:
 
-`configs/experiment.yaml` from the original plan was not added: `.env` is the single configuration source, which avoids two places defining the same values.
+* **`MoEAdapter`**: discover layers, get the router and experts, route (with or without a pruning mask), run one MoE layer, replace experts, instrument a forward pass, check that removed weights are gone, and load an original expert from disk. A forward pass yields, per layer, an `MoEForwardRecord` with the residual stream, MoE input and output, the top-k expert indices and gates, and the *un-gated* expert outputs.
+* **`TaskObjective`**: turns calibration records and evaluation documents into model inputs, provides per-stack real-token masks, and defines the loss, predictions and qualitative generations.
+
+## Model plugins
+
+A plugin bundles an adapter, a task and the HF auto class. The plugin is selected automatically from the model's `config.model_type`, so switching models only means changing `HF_MODEL_ID` or `MODEL_PATH` (or the profile).
+
+**Adding a model** (e.g. Mixtral or Qwen-MoE):
+
+1. Write an adapter subclassing `moe_pruning.model.architecture.MoEAdapter`. Use `models/olmoe/adapter.py` as the template for transformers-5 fused experts (`gate_up_proj`/`down_proj` 3D tensors) and `models/switch_transformers/adapter.py` for per-expert modules.
+2. Pick a task (`CausalLMTask` or `Seq2SeqDenoisingTask`) or write one.
+3. Register the plugin:
+
+```python
+from transformers import AutoModelForCausalLM
+from moe_pruning.models import ModelPlugin, register_plugin
+from moe_pruning.tasks.causal_lm import CausalLMTask
+from my_package.mixtral_adapter import MixtralAdapter
+
+register_plugin(ModelPlugin(
+    name="mixtral", model_types=("mixtral",),
+    adapter_factory=MixtralAdapter, task_factory=CausalLMTask,
+    auto_model_class=AutoModelForCausalLM, description="Mixtral sparse MoE",
+))
+```
+
+4. Make it discoverable in one of three ways: put it in `src/moe_pruning/models/<name>/` (imported automatically), list the module in `MODEL_PLUGINS=my_package.mixtral_plugin` in `.env`, or expose it as a Python entry point in the `moe_pruning.models` group.
+5. Add a profile `configs/<model>.env`, run `scripts/inspect_model.py` (its probe verifies that the layer output equals $\sum_k g_k E_k(x)$), and copy `tests/test_olmoe.py` for the new model's tests.
+
+## How OLMoE is handled
+
+Verified against `transformers/models/olmoe/modeling_olmoe.py` (5.22) and the hub checkpoint:
+
+* `OlmoeDecoderLayer`: $\text{out} = h + \text{MoE}(\text{RMSNorm}(h))$, where $h$ is the residual stream after attention. Every layer is sparse (`model.layers.{i}.mlp`, layer ids `layers.{i}`).
+* Router (`OlmoeTopKRouter`): $p=\text{softmax}(Wx)$ in float32, top-8 of 64. The top-k weights are **not** renormalised (`norm_topk_prob=False`). There is no capacity limit, so no tokens are dropped.
+* Gate application: `OlmoeExperts.forward` multiplies each expert output by its top-k weight exactly once, so `BiasExpert` again returns $b_e$ only. The probe in `inspect_model.py` checks this.
+* **Fused experts:** transformers 5 stores all 64 experts of a layer as two 3D tensors (`gate_up_proj` [64, 2·1024, 2048], `down_proj` [64, 2048, 1024]), while the hub checkpoint stores them per expert (`experts.{e}.gate_proj/up_proj/down_proj`) and transformers fuses them on load as `[gate; up]`. A single expert can't be swapped as a module, so the adapter replaces the layer's container with `PrunedFusedExperts`. That container:
+  * keeps **only the retained experts' rows**, so the removed weights really leave memory and the checkpoint, and records their original ids;
+  * serves removed experts through their replacement module (`replaced.{e}`: `BiasExpert` or `ZeroExpert`), keyed by the *original* router index.
+* EASY-EP with top-k: $c_{e,t}=g_{e,t}\lVert E_e(x_t)\rVert$ for each of the token's 8 experts, and $s_t$ is computed from the full routed MoE output, exactly as in EASY-EP's DeepSeek code. The fused kernel doesn't expose per-expert outputs, so the instrumentation recomputes them from the same weights and verifies $\sum_k g_k E_k(x) = y$.
+* `reroute` with top-k: tokens choose their top-8 among the remaining experts, and the gates are the original probabilities (renormalised only if `norm_topk_prob`).
+* Calibration (`CausalLMTask`): the prompt is `"User: {human}\nAssistant: "`, or the tokenizer's chat template if it has one, followed by the response and EOS. All tokens feed the MoE statistics; only the response tokens are labelled.
+* Evaluation: next-token loss on the C4 documents (first `MAX_SOURCE_LENGTH` tokens) plus perplexity, which is meaningful for a causal LM.
+* Precision: the profile uses bfloat16. Bias vectors are kept in float32 and cast to the hidden-state dtype, so small updates aren't lost. The gate-consistency checks use a bfloat16-appropriate tolerance.
+* Bias training: with top-k a token can mix several replaced experts, which couples their biases. The trainer therefore reports no closed-form optimum for OLMoE.
 
 ## How Switch Transformer routing is handled
 
@@ -200,12 +267,13 @@ The loader builds the architecture from `config.json` on the meta device, instal
 |---|---|
 | `MODEL_PATH` | Local model directory. Empty: download `HF_MODEL_ID`. A non-empty invalid path is an error (no silent download). |
 | `HF_MODEL_ID`, `HF_REVISION` | Hugging Face model id and optional revision. |
-| `MODEL_DTYPE` | `float32` (default, recommended on MPS), `float16`, `bfloat16`. |
+| `MODEL_DTYPE` | `float32` (default, recommended on MPS), `float16`, `bfloat16` (OLMoE profile). |
+| `MODEL_PLUGINS` | Extra plugin modules to import (comma-separated); built-in plugins are always available. |
 | `DEVICE` | `auto` (CUDA → MPS → CPU) or explicit `cuda`/`mps`/`cpu`. An unavailable explicit device is an error. |
 | `CALIBRATION_DATASET_PATH` | JSONL with `human`/`response`. |
 | `EVALUATION_DATASET_PATH` | Output of the C4 builder / input of evaluation. |
 | `CALIBRATION_MAX_SAMPLES`, `CALIBRATION_BATCH_SIZE` | Calibration size and batch size. |
-| `MAX_SOURCE_LENGTH`, `MAX_TARGET_LENGTH` | Token limits (encoder / decoder). |
+| `MAX_SOURCE_LENGTH`, `MAX_TARGET_LENGTH` | Token limits. Seq2seq: encoder / decoder. Causal: prompt / response (calibration); `MAX_SOURCE_LENGTH` is also the evaluation document length. |
 | `C4_DATASET_ID`, `C4_CONFIG`, `C4_SPLIT` | Streamed C4 source. |
 | `C4_DOMAIN` | Label recorded in the manifest. |
 | `C4_MAX_SAMPLES`, `C4_MAX_SCANNED` | Target accepted documents; scan limit. |
@@ -233,7 +301,7 @@ The loader builds the architecture from `config.json` on the meta device, instal
 ## Tests
 
 ```bash
-uv run pytest            # 78 tests; unit tests use a tiny random Switch model on CPU
+uv run pytest            # 105 tests; unit tests use tiny random Switch and OLMoE models on CPU
 uv run pytest -m integration   # tests on the real google/switch-base-8 (skipped if not cached)
 ```
 
@@ -249,6 +317,8 @@ They cover:
 - **Serialization:** removed weights absent, strict loader, output equality.
 - **Replacement methods:** drop zeroes only the removed experts' tokens; reroute sends them to the best remaining expert with the original gate, leaves every other token unchanged and respects capacity; checkpoints round-trip for every method.
 - **Evaluation:** the reference probe matches the true layer error for every method.
+- **OLMoE:** discovery, top-k instrumentation, expert views versus the raw weights, original experts loaded from both the hub and fused layouts, causal tokenization and loss, top-k statistics with padding, fused-expert compaction for bias/drop/reroute, repeated compaction, checkpoint round trips (compact tensor shapes, routing mask restored), the exact probe, and bias training.
+- **Plugins:** built-in discovery, loading an external plugin module, conflict detection, profile layering.
 
 ## Reproducibility notes
 
@@ -263,10 +333,23 @@ Seeds are fixed (`SEED`, `EVAL_SEED`, per-example corruption RNG, seeded calibra
 * The C4 subset is heuristic (see above).
 * The layer-MSE objective is local, and with Adam at `BIAS_LEARNING_RATE=0.001` the biases (‖b‖ ≈ 10²) barely move in 100 steps. Use a learning rate on the scale of the bias coordinates, or the closed-form optimum.
 
-## Moving to OLMoE
+## Running OLMoE
 
-* Write an `OlmoeAdapter` (top-8 of 64 experts, decoder-only, no capacity limit). `MoEForwardRecord` already supports top-k (`[B,S,K]` indices and gates), and the accumulator handles `K>1`.
-* Check whether OLMoE normalises the top-k probabilities (`norm_topk_prob`) and where the gate is multiplied; `inspect_model.py`'s probe verifies this.
-* Decoder-only: a single `decoder` stack. Calibration becomes prompt + response with the loss on the response, and evaluation should use next-token loss rather than span corruption.
-* The closed-form layer-MSE optimum assumes top-1 (it recovers $E=y/g$). With top-k the outputs of several experts are mixed per token, so recover them from the instrumented record instead.
-* Memory: OLMoE-1B-7B in fp32 needs about 28 GB. Use bf16 on a larger machine, keep `CALIBRATION_BATCH_SIZE` small, and prune layer by layer.
+OLMoE support is implemented and tested on a tiny random OLMoE with the real `allenai/OLMoE-1B-7B-0125` tokenizer: unit tests, plus an end-to-end run of every script on MPS in bfloat16. It has **not** been run on the real 6.9B model, which needs about 14 GB in bfloat16 plus a 28 GB download, more than the development Mac has. On a GPU machine:
+
+```bash
+P="--profile configs/olmoe-1b-7b-0125.env"
+uv run python scripts/inspect_model.py $P
+uv run python scripts/collect_stats.py $P
+uv run python scripts/score_experts.py $P          # 16 of 64 experts per layer by default
+uv run python scripts/replace_experts.py $P
+uv run python scripts/evaluate.py --stage before_training $P
+uv run python scripts/train_biases.py $P            # bias method only
+uv run python scripts/evaluate.py --stage after_training $P
+uv run python scripts/export_model.py $P
+```
+
+Notes:
+* Set `BIAS_LEARNING_RATE` relative to the bias magnitudes (`bias_norm` in `bias_initialization.json`): Adam moves each coordinate by about the learning rate per step.
+* The evaluation probe reads the removed experts' original weights lazily from the downloaded shards, so it needs no second model copy.
+* `PrunedFusedExperts` loops over the routed experts in Python, as transformers' eager experts implementation does. It is correct but slower than `grouped_mm`.

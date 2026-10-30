@@ -1,8 +1,10 @@
 """Centralised, validated experiment configuration.
 
 The ``.env`` file in the project root is the primary configuration source.
-Scripts may override individual values with ``--set KEY=VALUE`` (the key is the
-environment-variable name), which is applied on top of the environment.
+Per-model settings live in profiles (``configs/<model>.env``) layered on top
+with ``--profile`` (or the ``MOE_PROFILE`` environment variable). Scripts may
+override individual values with ``--set KEY=VALUE`` (the key is the
+environment-variable name), which is applied last.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ class ExperimentConfig:
     hf_model_id: str
     hf_revision: str | None
     model_dtype: str
+    model_plugins: tuple[str, ...]
     # Device
     device: str
     # Datasets
@@ -207,10 +210,17 @@ class _Reader:
         return path
 
 
-def _collect_values(env_file: Path | None, overrides: dict[str, str] | None) -> dict[str, str]:
+def _collect_values(
+    env_file: Path | None, overrides: dict[str, str] | None, profiles: list[Path] | None = None
+) -> dict[str, str]:
     values: dict[str, str] = {}
     if env_file is not None and env_file.exists():
         values.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
+    # Model profiles (e.g. configs/olmoe-1b-7b-0125.env) are layered on top of .env.
+    for profile in profiles or []:
+        if not profile.exists():
+            raise ConfigError(f"Profile {profile} does not exist")
+        values.update({k: v for k, v in dotenv_values(profile).items() if v is not None})
     # Real environment variables take precedence over the .env file, as with
     # python-dotenv's default ``override=False`` behaviour.
     for key in list(values) + [k for k in os.environ if k.isupper()]:
@@ -224,15 +234,23 @@ def _collect_values(env_file: Path | None, overrides: dict[str, str] | None) -> 
 def load_config(
     env_file: Path | str | None = DEFAULT_ENV_FILE,
     overrides: dict[str, str] | None = None,
+    profiles: list[Path | str] | None = None,
 ) -> ExperimentConfig:
     """Load and validate the configuration.
+
+    Precedence (lowest to highest): ``.env`` < profiles (in order) <
+    environment variables < ``overrides`` (``--set``).
 
     Raises:
         ConfigError: if any value is missing or invalid. All problems are
             reported at once.
     """
     env_path = Path(env_file) if env_file is not None else None
-    values = _collect_values(env_path, overrides)
+    profile_paths = []
+    for profile in profiles or []:
+        path = Path(profile).expanduser()
+        profile_paths.append(path if path.is_absolute() else PROJECT_ROOT / path)
+    values = _collect_values(env_path, overrides, profile_paths)
     r = _Reader(values)
 
     model_path = r.str("MODEL_PATH", "", required=False)
@@ -243,6 +261,7 @@ def load_config(
         hf_model_id=r.str("HF_MODEL_ID", "google/switch-base-8"),
         hf_revision=revision,
         model_dtype=r.choice("MODEL_DTYPE", VALID_DTYPES, "float32"),
+        model_plugins=_split_csv(r.str("MODEL_PLUGINS", "", required=False)),
         device=r.choice("DEVICE", VALID_DEVICES, "auto"),
         calibration_dataset_path=r.path("CALIBRATION_DATASET_PATH", "./data/calibration.jsonl"),
         evaluation_dataset_path=r.path(
@@ -342,6 +361,14 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         metavar="KEY=VALUE",
         help="Override a configuration value, e.g. --set PRUNE_EXPERTS_PER_LAYER=3. Repeatable.",
     )
+    parser.add_argument(
+        "--profile",
+        dest="profiles",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Model profile layered on top of .env, e.g. --profile configs/olmoe-1b-7b-0125.env. Repeatable.",
+    )
     return parser
 
 
@@ -352,4 +379,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
             raise ConfigError(f"--set expects KEY=VALUE, got {item!r}")
         key, value = item.split("=", 1)
         overrides[key.strip().upper()] = value
-    return load_config(args.env_file, overrides)
+    profiles = list(args.profiles)
+    if not profiles and os.environ.get("MOE_PROFILE"):
+        profiles = [os.environ["MOE_PROFILE"]]
+    return load_config(args.env_file, overrides, profiles)

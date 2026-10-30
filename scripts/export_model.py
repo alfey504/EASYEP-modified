@@ -19,17 +19,18 @@ import logging
 from datetime import datetime, timezone
 
 import torch
-from safetensors import safe_open
 
 from moe_pruning.data.calibration import prepare_calibration
-from moe_pruning.data.collators import collate_seq2seq
 from moe_pruning.serialization.checkpoint import (
     WEIGHTS_NAME,
     expected_bias_keys,
     load_pruned_model,
-    replaced_expert_prefixes,
+    removed_weight_violations,
     save_pruned_model,
+    stored_tensor_shapes,
 )
+from moe_pruning.model.architecture import get_adapter
+from moe_pruning.model.loader import get_model_plugin
 from moe_pruning.utils.cli import bootstrap
 from moe_pruning.utils.device import empty_cache, resolve_device
 from moe_pruning.utils.paths import read_json, write_json
@@ -61,8 +62,9 @@ def main() -> None:
         source_dir = paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
 
     model, tokenizer, manifest = load_pruned_model(source_dir, device)
-    calib = prepare_calibration(cfg, tokenizer)
-    probe = collate_seq2seq(calib.items[:4], tokenizer.pad_token_id)
+    task = get_model_plugin(cfg).task()
+    calib = prepare_calibration(cfg, tokenizer, task)
+    probe = task.collate(calib.items[:4], tokenizer.pad_token_id)
     with torch.no_grad():
         reference_logits = model(**probe.model_inputs(device)).logits.float().cpu()
 
@@ -82,25 +84,28 @@ def main() -> None:
     gc.collect()
     empty_cache(device)
 
-    # 1. No original weights of replaced experts in the file.
-    prefixes = replaced_expert_prefixes(manifest)
-    with safe_open(str(out_dir / WEIGHTS_NAME), framework="pt") as fh:
-        stored = list(fh.keys())
-    leaked = [k for k in stored for p in prefixes if k.startswith(p) and k != p + "bias"]
-    biases_present = all(k in stored for k in expected_bias_keys(manifest))
+    # 1. Reload with the custom loader (this also validates keys and shapes).
+    reloaded, _, _ = load_pruned_model(out_dir, device)
+
+    # 2. No original weights of replaced experts in the file (adapter-specific rules,
+    #    e.g. per-expert keys for Switch, compacted fused tensors for OLMoE).
+    shapes = stored_tensor_shapes(out_dir / WEIGHTS_NAME)
+    leaked = removed_weight_violations(get_adapter(reloaded), reloaded, shapes, manifest)
+    biases_present = all(k in shapes for k in expected_bias_keys(manifest))
     if leaked or not biases_present:
         raise RuntimeError(f"Export check failed: leaked={leaked} biases_present={biases_present}")
 
-    # 2./3. Reload and compare.
-    reloaded, _, _ = load_pruned_model(out_dir, device)
+    # 3. Same outputs as the in-memory model.
     with torch.no_grad():
         reloaded_logits = reloaded(**probe.model_inputs(device)).logits.float().cpu()
     max_diff = float((reloaded_logits - reference_logits).abs().max())
     ok = max_diff <= ATOL
+    n_removed = sum(len(entry["expert_ids"]) for entry in manifest["layers"].values())
     verification = {
         "verified_at": datetime.now(timezone.utc).isoformat(),
         "replaced_expert_weights_absent": not leaked,
         "bias_vectors_present": biases_present,
+        "replacement_method": manifest.get("replacement_method", "bias"),
         "reloaded_with": "moe_pruning.serialization.checkpoint.load_pruned_model",
         "reload_max_abs_logit_difference": max_diff,
         "tolerance": ATOL,
@@ -112,7 +117,7 @@ def main() -> None:
         raise RuntimeError(f"Reloaded model differs from the in-memory model (max |diff| {max_diff:.2e})")
     logger.info(
         "Export verified: %d replaced experts absent from the checkpoint, reload max |Δlogit| = %.2e",
-        len(prefixes), max_diff,
+        n_removed, max_diff,
     )
     logger.info("Exported model: %s", out_dir)
 

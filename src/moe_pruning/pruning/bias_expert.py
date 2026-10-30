@@ -33,9 +33,14 @@ class BiasExpert(nn.Module):
         self.bias = nn.Parameter(value)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return b broadcast to ``hidden_states.shape[:-1] + (output_dim,)`` (un-gated)."""
+        """Return b broadcast to ``hidden_states.shape[:-1] + (output_dim,)`` (un-gated).
+
+        The output has the dtype of ``hidden_states`` like any expert; the
+        parameter itself may be kept in higher precision (float32 for
+        half-precision models) so that small optimiser updates are not lost.
+        """
         shape = (*hidden_states.shape[:-1], self.output_dim)
-        return self.bias.expand(shape).clone()
+        return self.bias.to(hidden_states.dtype).expand(shape).clone()
 
     def extra_repr(self) -> str:
         return f"output_dim={self.output_dim}"

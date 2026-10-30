@@ -20,9 +20,8 @@ from datetime import datetime, timezone
 import torch
 
 from moe_pruning.data.calibration import prepare_calibration
-from moe_pruning.data.collators import iter_batches
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.loader import load_original_model, load_tokenizer
+from moe_pruning.model.loader import get_model_plugin, load_original_model, load_tokenizer
 from moe_pruning.pruning.bias_expert import BiasExpert
 from moe_pruning.pruning.replacement import freeze_all_but_biases
 from moe_pruning.serialization.checkpoint import load_pruned_model, save_pruned_model
@@ -52,7 +51,8 @@ def main() -> None:
     replaced_dir = paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
 
     tokenizer = load_tokenizer(cfg)
-    calib = prepare_calibration(cfg, tokenizer)
+    task = get_model_plugin(cfg).task()
+    calib = prepare_calibration(cfg, tokenizer, task)
     from moe_pruning.utils.paths import read_json
 
     replaced_manifest = read_json(replaced_dir / "pruning_manifest.json")
@@ -81,7 +81,7 @@ def main() -> None:
         loaded = load_original_model(cfg, device)
         adapter = get_adapter(loaded.model)
         layers = {layer.layer_id: layer for layer in adapter.discover_layers(loaded.model)}
-        batches = list(iter_batches(calib.items, cfg.calibration_batch_size, tokenizer.pad_token_id))
+        batches = list(task.iter_batches(calib.items, cfg.calibration_batch_size, tokenizer.pad_token_id))
         with timed() as t:
             refs = capture_layer_references(
                 loaded.model, adapter, [layers[i] for i in layer_ids], batches, device

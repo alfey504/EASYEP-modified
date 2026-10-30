@@ -99,3 +99,36 @@ def tiny_tokenizer():
     tok = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
     tok.pre_tokenizer = Whitespace()
     return PreTrainedTokenizerFast(tokenizer_object=tok, pad_token="<pad>", eos_token="</s>", unk_token="<unk>")
+
+
+def make_tiny_olmoe(seed: int = 0, sharpen_router: float = 40.0, **overrides):
+    """Tiny random OLMoE (8 experts, top-2). The router is sharpened so gates are distinct."""
+    from transformers import OlmoeConfig, OlmoeForCausalLM
+
+    params = dict(
+        vocab_size=96,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_experts=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=False,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=None,
+        tie_word_embeddings=False,
+    )
+    params.update(overrides)
+    torch.manual_seed(seed)
+    model = OlmoeForCausalLM(OlmoeConfig(**params)).eval()
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.mlp.gate.weight.mul_(sharpen_router)
+    return model
+
+
+@pytest.fixture
+def tiny_olmoe():
+    return make_tiny_olmoe()

@@ -17,9 +17,8 @@ import logging
 import torch
 
 from moe_pruning.data.calibration import prepare_calibration
-from moe_pruning.data.collators import collate_seq2seq
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error
+from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error, gate_consistency_tolerance
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.pruning.bias_initialization import initialize_bias
 from moe_pruning.pruning.manifest import build_pruning_manifest
@@ -100,29 +99,30 @@ def main() -> None:
     report = replace_experts(model, adapter, layers, selection, method, biases if method == "bias" else None)
 
     # Probe the replaced layers on a few calibration examples.
-    calib = prepare_calibration(cfg, loaded.tokenizer)
-    probe = collate_seq2seq(calib.items[:4], loaded.tokenizer.pad_token_id)
+    task = loaded.plugin.task()
+    calib = prepare_calibration(cfg, loaded.tokenizer, task)
+    probe = task.collate(calib.items[:4], loaded.tokenizer.pad_token_id)
     collector = RecordCollector()
     pruned_layers = [layers[layer_id] for layer_id in selection]
     with torch.no_grad(), adapter.instrument(model, pruned_layers, collector):
         model(**probe.model_inputs(device))
     for rec in collector.records:
         err = gate_consistency_error(rec)["max_rel_error"]
-        if err > 1e-4:
+        if err > gate_consistency_tolerance(loaded.dtype):
             raise RuntimeError(f"{rec.layer_id}: gate consistency failed after replacement ({err:.2e})")
-        idx = rec.expert_index[..., 0]
+        idx = rec.expert_index  # [B, S, K]
         removed = selection[rec.layer_id]
         if method == "bias":
             for e in removed:
                 routed = idx == e
                 if routed.any():
-                    outs = rec.expert_output[..., 0, :][routed]
+                    outs = rec.expert_output[routed]
                     expected = biases[rec.layer_id][e].to(outs.device, outs.dtype).expand_as(outs)
                     torch.testing.assert_close(outs, expected)
         elif method == "drop":
             for e in removed:
                 routed = idx == e
-                if routed.any() and rec.moe_output[routed].abs().max() != 0:
+                if routed.any() and rec.expert_output[routed].abs().max() != 0:
                     raise RuntimeError(f"{rec.layer_id}: dropped expert {e} produced a non-zero output")
         else:  # reroute
             if any(bool((idx == e).any()) for e in removed):
@@ -131,14 +131,22 @@ def main() -> None:
                 orig_idx, orig_gate = adapter.route(
                     model, layers[rec.layer_id], rec.moe_input.to(device), apply_mask=False
                 )
-            orig_idx, orig_gate = orig_idx[..., 0].cpu(), orig_gate[..., 0].cpu()
-            # Tokens whose original expert is kept: same expert and gate (unless now capacity-dropped).
-            kept = (orig_idx >= 0) & ~torch.isin(orig_idx, torch.tensor(removed, device=orig_idx.device)) & (idx >= 0)
-            if not torch.equal(idx[kept], orig_idx[kept]) or not torch.equal(rec.gate[..., 0][kept], orig_gate[kept]):
-                raise RuntimeError(f"{rec.layer_id}: rerouting changed tokens whose expert was not removed")
+            orig_idx, orig_gate = orig_idx.cpu(), orig_gate.cpu()
+            # Tokens with no removed expert among their original choices keep the same
+            # experts and gates (unless now dropped by an expert-capacity limit).
+            untouched = (
+                ~torch.isin(orig_idx, torch.tensor(removed)).any(dim=-1)
+                & (orig_idx >= 0).all(dim=-1)
+                & (idx >= 0).all(dim=-1)
+            )
+            if not torch.equal(idx[untouched], orig_idx[untouched]) or not torch.equal(
+                rec.gate[untouched], orig_gate[untouched]
+            ):
+                raise RuntimeError(f"{rec.layer_id}: rerouting changed tokens whose experts were not removed")
     logger.info("Verified replacement behaviour of %d layer(s) (method=%s)", len(collector.records), method)
 
     write_json(paths.bias_initialization_report, init_report)
+    logger.info("Model plugin: %s | task: %s", loaded.plugin.name, task.name)
     manifest = build_pruning_manifest(
         cfg, adapter, model.config.model_type, layers, selection, init_report,
         report.to_dict(), stats_manifest["calibration"]["fingerprint"], stage="replaced_before_training",

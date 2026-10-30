@@ -11,8 +11,9 @@ import logging
 
 import torch
 
+from moe_pruning.data.calibration import CalibrationRecord
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error
+from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error, gate_consistency_tolerance
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.utils.cli import bootstrap
 from moe_pruning.utils.paths import write_json
@@ -33,28 +34,29 @@ def main() -> None:
     report = adapter.describe(model)
     layers = adapter.discover_layers(model)
 
-    # --- Probe forward pass -------------------------------------------------
-    enc = tok(PROBE_SOURCE, return_tensors="pt").to(device)
-    labels = tok(text_target=PROBE_TARGET, return_tensors="pt").input_ids.to(device)
+    # --- Probe forward pass (inputs built by the plugin's task) -------------
+    task = loaded.plugin.task()
+    pair = task.tokenize_calibration([CalibrationRecord(PROBE_SOURCE, PROBE_TARGET, 0)], tok, 256, 128)
+    batch = task.collate(pair, tok.pad_token_id)
     collector = RecordCollector()
     with torch.no_grad(), adapter.instrument(model, layers, collector):
-        model(**enc, labels=labels)
+        model(**batch.model_inputs(device))
 
     probe = {}
     for layer_id, records in collector.by_layer().items():
         rec = records[0]
-        idx = rec.expert_index[..., 0]
+        idx = rec.expert_index
         counts = torch.bincount(idx[idx >= 0].flatten(), minlength=layers[0].num_experts)
         probe[layer_id] = {
-            "tokens": int(idx.numel()),
-            "dropped_by_capacity": int((idx < 0).sum()),
+            "tokens": int(idx[..., 0].numel()),
+            "dropped_by_capacity": int((idx < 0).all(dim=-1).sum()),
             "tokens_per_expert": counts.tolist(),
             "mean_gate": float(rec.gate[idx >= 0].mean()) if (idx >= 0).any() else None,
             "expert_output_shape": list(rec.expert_output.shape),
             **gate_consistency_error(rec),
         }
     max_err = max(p["max_rel_error"] for p in probe.values())
-    gate_ok = max_err < 1e-4
+    gate_ok = max_err < gate_consistency_tolerance(loaded.dtype)
     report["probe"] = {
         "source": PROBE_SOURCE,
         "target": PROBE_TARGET,
@@ -63,6 +65,8 @@ def main() -> None:
         "max_rel_error": max_err,
     }
     report["model_source"] = loaded.source
+    report["model_plugin"] = loaded.plugin.name
+    report["task"] = task.name
     report["revision"] = loaded.revision
     report["dtype"] = str(loaded.dtype).replace("torch.", "")
     report["environment"] = environment_info(device)
@@ -70,10 +74,12 @@ def main() -> None:
     write_json(paths.architecture_report, report)
 
     # --- Human-readable summary ---------------------------------------------
+    first = layers[0]
     logger.info(
-        "%s | %s | encoder-decoder=%s | d_model=%d d_ff=%d | experts=%d capacity=%d",
-        report["model_class"], report["adapter"], report["is_encoder_decoder"],
-        report["d_model"], report["d_ff"], report["num_experts"], report["expert_capacity"],
+        "%s | plugin %s | %s | encoder-decoder=%s | hidden=%d expert=%d->%d->%d | experts=%d top-%d capacity=%s",
+        report["model_class"], loaded.plugin.name, report["adapter"], report["is_encoder_decoder"],
+        first.hidden_dim, first.expert_input_dim, first.expert_intermediate_dim, first.expert_output_dim,
+        first.num_experts, first.top_k, first.expert_capacity,
     )
     logger.info(
         "Sparse MoE layers: %d (encoder %d, decoder %d)",

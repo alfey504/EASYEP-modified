@@ -35,6 +35,10 @@ def bootstrap(
 
     paths = ArtifactPaths(cfg)
     setup_logging(cfg.log_level, paths.log_file)
+    from moe_pruning.models import available_plugins, load_plugins
+
+    load_plugins(list(cfg.model_plugins))
+    logger.debug("Model plugins: %s", sorted(available_plugins()))
     set_seed(cfg.seed)
     logger.info("=== %s | experiment=%s ===", stage, cfg.experiment_name)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

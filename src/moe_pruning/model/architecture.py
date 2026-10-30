@@ -60,10 +60,11 @@ RecordCallback = Callable[[MoEForwardRecord], None]
 
 
 class MoEAdapter(ABC):
-    """Model-specific access to sparse MoE layers."""
+    """Model-specific access to sparse MoE layers.
 
-    #: model_type values (from the HF config) handled by this adapter
-    model_types: tuple[str, ...] = ()
+    Adapters are provided by model plugins (``moe_pruning.models``). Expert
+    ids always refer to the original router indices, also after pruning.
+    """
 
     @abstractmethod
     def discover_layers(self, model: nn.Module) -> list[MoELayerInfo]:
@@ -128,6 +129,54 @@ class MoEAdapter(ABC):
         """Machine-readable architecture report."""
 
     # ------------------------------------------------------------------
+    # Overridable defaults (per-expert modules addressed by a state prefix)
+    # ------------------------------------------------------------------
+    def replace_experts_in_layer(
+        self, model: nn.Module, layer: MoELayerInfo, modules: dict[int, nn.Module]
+    ) -> int:
+        """Install ``modules`` in their expert slots; return the number of removed parameters.
+
+        Default: one ``set_expert`` per expert. Adapters whose experts share
+        fused weight tensors override this to compact the tensors once.
+        """
+        removed = 0
+        for expert_id, module in sorted(modules.items()):
+            old = self.set_expert(model, layer, expert_id, module)
+            removed += sum(p.numel() for p in old.parameters())
+            del old
+        return removed
+
+    def removed_weight_violations(
+        self, state_shapes: dict[str, tuple[int, ...]], layer: MoELayerInfo, removed: list[int]
+    ) -> list[str]:
+        """Names of stored tensors that still hold weights of removed experts.
+
+        Default: any tensor under a removed expert's state prefix other than a
+        replacement ``bias``.
+        """
+        bad = []
+        for e in removed:
+            prefix = self.expert_state_prefix(layer, e)
+            bad += [k for k in state_shapes if k.startswith(prefix) and k != prefix + "bias"]
+        return bad
+
+    def load_original_expert(self, reader, model: nn.Module, layer: MoELayerInfo, expert_id: int) -> nn.Module:
+        """Rebuild one original expert from the original checkpoint (``reader``: CheckpointReader).
+
+        Default: tensors stored under the expert's state prefix.
+        """
+        prefix = self.expert_state_prefix(layer, expert_id)
+        module = self.build_original_expert(model, layer)
+        state = {k[len(prefix):]: reader.get(k) for k in reader.keys() if k.startswith(prefix)}
+        if not state:
+            raise KeyError(f"No tensors with prefix {prefix!r} in the original checkpoint")
+        module.load_state_dict(state, strict=True)
+        return module
+
+    def validate_loaded(self, model: nn.Module, layers: list[MoELayerInfo]) -> None:
+        """Called by the checkpoint loader after weights are loaded; raise on inconsistency."""
+
+    # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
     def get_experts(self, model: nn.Module, layer: MoELayerInfo) -> dict[int, nn.Module]:
@@ -163,21 +212,8 @@ def select_layers(layers: list[MoELayerInfo], spec: str) -> list[MoELayerInfo]:
     return [layer for layer in layers if layer.layer_id in set(wanted)]
 
 
-_ADAPTERS: list[type[MoEAdapter]] = []
-
-
-def register_adapter(cls: type[MoEAdapter]) -> type[MoEAdapter]:
-    _ADAPTERS.append(cls)
-    return cls
-
-
 def get_adapter(model: nn.Module) -> MoEAdapter:
-    # Import for registration side-effects.
-    from moe_pruning.model import switch_adapter  # noqa: F401
+    """Adapter of the model's plugin (looked up by ``config.model_type``)."""
+    from moe_pruning.models import plugin_for_model
 
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    for cls in _ADAPTERS:
-        if model_type in cls.model_types:
-            return cls()
-    supported = sorted(t for cls in _ADAPTERS for t in cls.model_types)
-    raise NotImplementedError(f"No MoE adapter for model_type={model_type!r}. Supported: {supported}")
+    return plugin_for_model(model).adapter()
