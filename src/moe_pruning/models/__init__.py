@@ -132,8 +132,8 @@ def plugin_for_model(model) -> ModelPlugin:
     return get_plugin(model_type)
 
 
-def plugin_for_source(source: str, revision: str | None = None) -> ModelPlugin:
+def plugin_for_source(source: str, revision: str | None = None, cache_dir: str | None = None) -> ModelPlugin:
     """Plugin of a local model directory or Hub id (reads only config.json)."""
     from transformers import AutoConfig
 
-    return get_plugin(AutoConfig.from_pretrained(source, revision=revision).model_type)
+    return get_plugin(AutoConfig.from_pretrained(source, revision=revision, cache_dir=cache_dir).model_type)

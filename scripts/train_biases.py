@@ -21,10 +21,10 @@ import torch
 
 from moe_pruning.data.calibration import prepare_calibration
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.loader import get_model_plugin, load_original_model, load_tokenizer
+from moe_pruning.model.loader import get_model_plugin, load_original_model, load_pruned_for_config, load_tokenizer
 from moe_pruning.pruning.bias_expert import BiasExpert
 from moe_pruning.pruning.replacement import freeze_all_but_biases
-from moe_pruning.serialization.checkpoint import load_pruned_model, save_pruned_model
+from moe_pruning.serialization.checkpoint import save_pruned_model
 from moe_pruning.training.bias_trainer import (
     cache_is_valid,
     capture_layer_references,
@@ -33,7 +33,7 @@ from moe_pruning.training.bias_trainer import (
     train_layer_biases,
 )
 from moe_pruning.utils.cli import bootstrap
-from moe_pruning.utils.device import empty_cache, resolve_device
+from moe_pruning.utils.device import empty_cache
 from moe_pruning.utils.paths import write_json
 from moe_pruning.utils.reproducibility import environment_info, memory_info, set_seed, timed
 
@@ -47,7 +47,6 @@ def main() -> None:
             f"REPLACEMENT_METHOD={cfg.replacement_method} has no trainable parameters; nothing to train. "
             "Evaluate with `scripts/evaluate.py --stage before_training`."
         )
-    device = resolve_device(cfg.device)
     replaced_dir = paths.require(paths.replaced_model_dir, "uv run python scripts/replace_experts.py")
 
     tokenizer = load_tokenizer(cfg)
@@ -78,7 +77,8 @@ def main() -> None:
     if cache_is_valid(cache_dir, layer_ids, cache_meta):
         logger.info("Reusing cached layer references from %s", cache_dir)
     else:
-        loaded = load_original_model(cfg, device)
+        loaded = load_original_model(cfg)
+        device = loaded.device
         adapter = get_adapter(loaded.model)
         layers = {layer.layer_id: layer for layer in adapter.discover_layers(loaded.model)}
         batches = list(task.iter_batches(calib.items, cfg.calibration_batch_size, tokenizer.pad_token_id))
@@ -94,7 +94,7 @@ def main() -> None:
         empty_cache(device)
 
     # 2. Replaced model with initialised biases.
-    model, _, manifest = load_pruned_model(replaced_dir, device)
+    model, _, manifest, device = load_pruned_for_config(cfg, replaced_dir)
     adapter = get_adapter(model)
     layers = {layer.layer_id: layer for layer in adapter.discover_layers(model)}
 
@@ -171,6 +171,7 @@ def main() -> None:
     save_pruned_model(
         model, tokenizer, paths.trained_model_dir, manifest,
         {"stage": "train_biases", "config": cfg.to_dict()},
+        checkpoint_format=cfg.checkpoint_format,
     )
     for r in results:
         logger.info(

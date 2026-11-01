@@ -3,23 +3,28 @@ name = "easy-ep2"
 version = "0.1.0"
 description = "EASY-EP expert selection with gate-weighted bias-vector replacement for MoE models"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
+# Lower bounds are deliberately loose so that preinstalled packages on hosted
+# notebooks (e.g. Kaggle's CUDA build of torch) are reused instead of replaced.
 dependencies = [
-    "torch>=2.15.0",
-    # Switch Transformer model + T5 tokenizer
-    "transformers>=4.46",
+    "torch>=2.4",
+    # transformers 5: fused-expert MoE layout used by the OLMoE plugin, `dtype=` kwarg
+    "transformers>=5.20",
+    # Multi-GPU placement (DEVICE_MAP)
+    "accelerate>=1.0",
+    # T5 tokenizer (switch-base-8)
     "sentencepiece>=0.2.0",
-    "protobuf>=5.28",
+    "protobuf>=3.20",
     # Streaming C4 evaluation data
-    "datasets>=3.0",
+    "datasets>=2.19",
     # Custom checkpoint format
-    "safetensors>=0.4.5",
+    "safetensors>=0.4.3",
     # Configuration
-    "python-dotenv>=1.0.1",
+    "python-dotenv>=1.0.0",
     # Utilities
-    "numpy>=2.1",
+    "numpy>=1.26",
     "tqdm>=4.66",
-    "psutil>=6.1",
+    "psutil>=5.9",
 ]
 
 [dependency-groups]

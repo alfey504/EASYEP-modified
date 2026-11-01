@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from moe_pruning.model.architecture import MoEAdapter, MoELayerInfo
+from moe_pruning.model.placement import module_device
 from moe_pruning.pruning.bias_expert import BiasExpert
 from moe_pruning.pruning.zero_expert import ZeroExpert
 
@@ -89,7 +90,6 @@ def replace_experts(
     if method == "bias" and biases is None:
         raise ValueError("The bias method needs initial bias vectors")
     dtype = next(model.parameters()).dtype
-    device = next(model.parameters()).device
     if dtype in (torch.float16, torch.bfloat16):
         dtype = torch.float32  # keep trainable bias vectors in full precision
     report = ReplacementReport(parameters_before=sum(p.numel() for p in model.parameters()))
@@ -98,6 +98,7 @@ def replace_experts(
     }
     for layer_id, expert_ids in selection.items():
         layer = layers[layer_id]
+        device = module_device(adapter.get_moe_module(model, layer))  # the layer's GPU when sharded
         modules: dict[int, nn.Module] = {}
         for expert_id in sorted(expert_ids):
             current = adapter.get_expert(model, layer, expert_id)
@@ -112,10 +113,10 @@ def replace_experts(
             adapter.set_routing_mask(model, layer, sorted(expert_ids))
 
     gc.collect()
-    if device.type == "mps":
-        torch.mps.empty_cache()
-    elif device.type == "cuda":
+    if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     for layer_id, digest in router_digests.items():
         if _module_digest(adapter.get_router(model, layers[layer_id])) != digest:

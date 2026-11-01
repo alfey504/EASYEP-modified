@@ -11,7 +11,7 @@ import torch
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from moe_pruning.config import ExperimentConfig
-from moe_pruning.utils.device import check_dtype_supported, log_device, resolve_device, resolve_dtype
+from moe_pruning.utils.device import check_dtype_supported, log_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +38,26 @@ def _source(cfg: ExperimentConfig) -> tuple[str, str | None]:
     return cfg.hf_model_id, cfg.hf_revision
 
 
+def hub_kwargs(cfg: ExperimentConfig) -> dict:
+    """``revision`` / ``cache_dir`` for every Hugging Face download (HF_CACHE_DIR)."""
+    _, revision = _source(cfg)
+    kwargs: dict = {"revision": revision}
+    if cfg.hf_cache_dir is not None:
+        kwargs["cache_dir"] = str(cfg.hf_cache_dir)
+    return kwargs
+
+
+def model_load_kwargs(cfg: ExperimentConfig) -> dict:
+    """Extra ``from_pretrained`` kwargs common to all model loads."""
+    kwargs = hub_kwargs(cfg)
+    if cfg.experts_implementation:
+        kwargs["experts_implementation"] = cfg.experts_implementation
+    return kwargs
+
+
 def load_tokenizer(cfg: ExperimentConfig) -> PreTrainedTokenizerBase:
-    source, revision = _source(cfg)
-    tokenizer = AutoTokenizer.from_pretrained(source, revision=revision)
+    source, _ = _source(cfg)
+    tokenizer = AutoTokenizer.from_pretrained(source, **hub_kwargs(cfg))
     if tokenizer.pad_token_id is None:
         # Right padding is always masked out; any id works, EOS is the usual choice.
         tokenizer.pad_token = tokenizer.eos_token
@@ -51,25 +68,39 @@ def get_model_plugin(cfg: ExperimentConfig):
     """Model plugin of the configured model (reads only its config.json)."""
     from moe_pruning.models import plugin_for_source
 
-    source, revision = _source(cfg)
-    return plugin_for_source(source, revision)
+    source, _ = _source(cfg)
+    kwargs = hub_kwargs(cfg)
+    return plugin_for_source(source, kwargs["revision"], kwargs.get("cache_dir"))
 
 
 def load_original_model(cfg: ExperimentConfig, device: torch.device | None = None) -> LoadedModel:
-    """Load the unmodified model in evaluation mode on the configured device."""
+    """Load the unmodified model in evaluation mode on its configured device(s).
+
+    With DEVICE_MAP set, weights are distributed over the GPUs while loading;
+    ``LoadedModel.device`` is then the device the inputs must go to.
+    """
+    from moe_pruning.model.placement import ModelPlacement, from_pretrained_kwargs, input_device, placement_from_config
+
     source, revision = _source(cfg)
-    device = device or resolve_device(cfg.device)
+    placement = placement_from_config(cfg)
+    if device is not None:
+        placement = ModelPlacement(device, placement.device_map, placement.max_memory)
     dtype = resolve_dtype(cfg.model_dtype)
-    check_dtype_supported(device, dtype)
-    log_device(device, dtype)
+    check_dtype_supported(placement.device, dtype)
+    log_device(placement.device, dtype)
+    logger.info("Placement: %s", placement.describe())
 
     origin = "local directory" if cfg.model_path else "Hugging Face Hub"
     logger.info("Loading model %s from %s (revision=%s)", source, origin, revision or "default")
     plugin = get_model_plugin(cfg)
     logger.info("Model plugin: %s (%s)", plugin.name, plugin.description)
-    model = plugin.auto_model_class.from_pretrained(source, revision=revision, dtype=dtype)
-    model.to(device)
+    model = plugin.auto_model_class.from_pretrained(
+        source, dtype=dtype, **model_load_kwargs(cfg), **from_pretrained_kwargs(placement)
+    )
+    if not placement.sharded:
+        model.to(placement.device)
     model.eval()
+    device = input_device(model)
     tokenizer = load_tokenizer(cfg)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Loaded %s with %.1fM parameters", type(model).__name__, n_params / 1e6)
@@ -127,7 +158,9 @@ def open_original_checkpoint(cfg: ExperimentConfig) -> CheckpointReader:
     source, revision = _source(cfg)
     if cfg.model_path:
         return CheckpointReader(Path(cfg.model_path))
-    model_dir = snapshot_download(source, revision=revision, allow_patterns=["*.safetensors", "*.bin", "*.json"])
+    model_dir = snapshot_download(
+        source, allow_patterns=["*.safetensors", "*.bin", "*.json"], **hub_kwargs(cfg)
+    )
     return CheckpointReader(Path(model_dir))
 
 
@@ -145,3 +178,21 @@ class StateDictReader:
 
     def get(self, name: str) -> torch.Tensor:
         return self._state[name].clone()
+
+
+def load_pruned_for_config(cfg: ExperimentConfig, model_path: Path):
+    """``load_pruned_model`` with the configured placement, cache dir and base model.
+
+    Returns (model, tokenizer, manifest, input_device).
+    """
+    from moe_pruning.model.placement import input_device, placement_from_config
+    from moe_pruning.serialization.checkpoint import load_pruned_model
+
+    placement = placement_from_config(cfg)
+    model, tokenizer, manifest = load_pruned_model(
+        model_path,
+        placement=placement,
+        base_model_source=_source(cfg)[0],
+        load_kwargs=model_load_kwargs(cfg),
+    )
+    return model, tokenizer, manifest, input_device(model)

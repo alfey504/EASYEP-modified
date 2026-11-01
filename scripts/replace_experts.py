@@ -20,6 +20,7 @@ from moe_pruning.data.calibration import prepare_calibration
 from moe_pruning.model.architecture import get_adapter
 from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error, gate_consistency_tolerance
 from moe_pruning.model.loader import load_original_model
+from moe_pruning.model.placement import module_device
 from moe_pruning.pruning.bias_initialization import initialize_bias
 from moe_pruning.pruning.manifest import build_pruning_manifest
 from moe_pruning.pruning.replacement import replace_experts
@@ -128,8 +129,9 @@ def main() -> None:
             if any(bool((idx == e).any()) for e in removed):
                 raise RuntimeError(f"{rec.layer_id}: tokens were routed to a removed expert")
             with torch.no_grad():
+                layer_device = module_device(adapter.get_router(model, layers[rec.layer_id]))
                 orig_idx, orig_gate = adapter.route(
-                    model, layers[rec.layer_id], rec.moe_input.to(device), apply_mask=False
+                    model, layers[rec.layer_id], rec.moe_input.to(layer_device), apply_mask=False
                 )
             orig_idx, orig_gate = orig_idx.cpu(), orig_gate.cpu()
             # Tokens with no removed expert among their original choices keep the same
@@ -154,6 +156,7 @@ def main() -> None:
     save_pruned_model(
         model, loaded.tokenizer, paths.replaced_model_dir, manifest,
         {"stage": "replace_experts", "config": cfg.to_dict(), "memory": memory_info(device)},
+        checkpoint_format=cfg.checkpoint_format,
     )
     logger.info(
         "Removed %d parameters (%.2f%% of %d). Replaced model saved to %s",

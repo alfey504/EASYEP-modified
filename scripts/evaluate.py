@@ -23,10 +23,15 @@ import torch
 from moe_pruning.evaluation.evaluator import build_reference_probe, evaluate_model, prepare_eval_examples
 from moe_pruning.evaluation.metrics import compare_to_baseline, per_example_comparison, prediction_agreement
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.loader import get_model_plugin, load_original_model, load_tokenizer, open_original_checkpoint
-from moe_pruning.serialization.checkpoint import load_pruned_model
+from moe_pruning.model.loader import (
+    get_model_plugin,
+    load_original_model,
+    load_pruned_for_config,
+    load_tokenizer,
+    open_original_checkpoint,
+)
 from moe_pruning.utils.cli import bootstrap
-from moe_pruning.utils.device import empty_cache, resolve_device
+from moe_pruning.utils.device import empty_cache
 from moe_pruning.utils.paths import read_json, write_json
 from moe_pruning.utils.reproducibility import environment_info, memory_info, timed
 
@@ -66,14 +71,13 @@ def _model_dir(paths, stage: str):
 
 
 def run_stage(stage: str, cfg, paths, examples, settings, tokenizer, task) -> dict:
-    device = resolve_device(cfg.device)
     probe = None
     manifest = None
     if stage == "original":
-        loaded = load_original_model(cfg, device)
-        model = loaded.model
+        loaded = load_original_model(cfg)
+        model, device = loaded.model, loaded.device
     else:
-        model, _, manifest = load_pruned_model(_model_dir(paths, stage), device)
+        model, _, manifest, device = load_pruned_for_config(cfg, _model_dir(paths, stage))
         if manifest.get("replacement_method", "bias") != cfg.replacement_method:
             raise SystemExit(
                 f"Checkpoint uses REPLACEMENT_METHOD={manifest.get('replacement_method', 'bias')}, "

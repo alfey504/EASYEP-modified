@@ -55,7 +55,8 @@ def memory_info(device: torch.device) -> dict:
         info["mps_allocated_gb"] = round(torch.mps.current_allocated_memory() / 1e9, 3)
         info["mps_driver_allocated_gb"] = round(torch.mps.driver_allocated_memory() / 1e9, 3)
     elif device.type == "cuda":
-        info["cuda_max_allocated_gb"] = round(torch.cuda.max_memory_allocated(device) / 1e9, 3)
+        for i in range(torch.cuda.device_count()):
+            info[f"cuda{i}_max_allocated_gb"] = round(torch.cuda.max_memory_allocated(i) / 1e9, 3)
     return info
 
 

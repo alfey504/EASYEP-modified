@@ -68,6 +68,7 @@ class CausalLMTask(TaskObjective):
         return logits[:, :-1], labels[:, 1:]
 
     def token_nll(self, logits, labels):
+        labels = labels.to(logits.device)  # sharded models return logits on the last GPU
         logits, labels = self._shift(logits, labels)
         nll = torch.nn.functional.cross_entropy(
             logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100, reduction="none"
@@ -76,6 +77,7 @@ class CausalLMTask(TaskObjective):
         return (nll * mask).sum(dim=-1), mask.sum(dim=-1)
 
     def predictions(self, logits, labels):
+        labels = labels.to(logits.device)
         logits, labels = self._shift(logits, labels)
         argmax = logits.argmax(dim=-1).cpu()
         mask = (labels != -100).cpu()

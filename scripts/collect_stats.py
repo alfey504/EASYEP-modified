@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from moe_pruning.data.calibration import prepare_calibration
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.instrumentation import gate_consistency_error, gate_consistency_tolerance
+from moe_pruning.model.instrumentation import assert_finite, gate_consistency_error, gate_consistency_tolerance
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.scoring.statistics import ExpertStatisticsAccumulator
 from moe_pruning.utils.cli import bootstrap
@@ -48,6 +48,7 @@ def main() -> None:
 
     def on_record(record):
         nonlocal max_gate_err
+        assert_finite(record.moe_output, f"{record.layer_id} MoE output", loaded.dtype)
         stack = stack_of[record.layer_id]
         token_mask = current["masks"][stack]
         bias_mask = token_mask & current["train_rows"][:, None]

@@ -1,17 +1,29 @@
 """Compact, reloadable checkpoints for models with replaced experts.
 
-Format (directory)::
+Two formats (``CHECKPOINT_FORMAT``):
 
-    config.json              original HF model configuration
-    generation_config.json   (if present)
-    tokenizer files
+``full`` (default) - self-contained::
+
+    config.json, generation_config.json, tokenizer files
     model.safetensors        retained weights + BiasExpert biases (bias method); NO weights of replaced experts
     pruning_manifest.json    replaced experts and method per layer, bias details, tied-weight aliases
     experiment_config.json   configuration of the run that produced the checkpoint
     README.md
 
-Tied tensors (e.g. shared embeddings / lm_head) are stored once; their aliases
-are listed in the manifest and restored on load.
+``delta`` - only what differs from the base model (a few MB instead of the
+whole model; for limited disk, e.g. Kaggle)::
+
+    config.json, generation_config.json, tokenizer files
+    replacements.safetensors BiasExpert biases only (empty for drop / reroute)
+    pruning_manifest.json    as above + ``base_model`` (source, revision, dtype)
+    experiment_config.json, README.md
+
+A delta checkpoint is rebuilt by loading the base model and re-applying the
+same replacement, so the original weights of removed experts are never
+stored (and are dropped again on load).
+
+Tied tensors (e.g. shared embeddings / lm_head) are stored once in ``full``
+checkpoints; their aliases are listed in the manifest and restored on load.
 
 ``load_pruned_model`` is required to load this format. A plain
 ``from_pretrained`` would re-create the original experts with random weights,
@@ -31,8 +43,9 @@ from torch import nn
 from transformers import AutoConfig, AutoTokenizer
 
 from moe_pruning.model.architecture import MoEAdapter, get_adapter
+from moe_pruning.model.placement import ModelPlacement, from_pretrained_kwargs, place_model
 from moe_pruning.models import get_plugin
-from moe_pruning.pruning.replacement import make_replacement_module
+from moe_pruning.pruning.replacement import make_replacement_module, replace_experts
 from moe_pruning.utils.paths import read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -40,6 +53,8 @@ logger = logging.getLogger(__name__)
 FORMAT_NAME = "moe-pruning/bias-replaced-experts"
 FORMAT_VERSION = 1
 WEIGHTS_NAME = "model.safetensors"
+DELTA_WEIGHTS_NAME = "replacements.safetensors"
+CHECKPOINT_FORMATS = ("full", "delta")
 MANIFEST_NAME = "pruning_manifest.json"
 EXPERIMENT_CONFIG_NAME = "experiment_config.json"
 
@@ -140,9 +155,14 @@ def save_pruned_model(
     manifest: dict,
     experiment_config: dict,
     readme: str | None = None,
+    checkpoint_format: str = "full",
 ) -> Path:
     """Write the checkpoint and verify that no replaced expert weights are stored."""
+    if checkpoint_format not in CHECKPOINT_FORMATS:
+        raise ValueError(f"checkpoint_format must be one of {CHECKPOINT_FORMATS}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    if checkpoint_format == "delta":
+        return _save_delta(model, tokenizer, output_dir, manifest, experiment_config, readme)
     tensors, aliases = deduplicate_state_dict(model.state_dict())
 
     adapter = get_adapter(model)
@@ -157,12 +177,22 @@ def save_pruned_model(
         **manifest,
         "format": FORMAT_NAME,
         "format_version": FORMAT_VERSION,
+        "checkpoint_format": "full",
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "tied_aliases": aliases,
         "num_stored_tensors": len(tensors),
         "num_stored_parameters": int(sum(t.numel() for t in tensors.values())),
     }
     save_file(tensors, str(output_dir / WEIGHTS_NAME), metadata={"format": "pt", "pruning_format": FORMAT_NAME})
+    _write_metadata(model, tokenizer, output_dir, manifest, experiment_config, readme)
+    logger.info(
+        "Saved pruned checkpoint to %s (%d tensors, %.1fM parameters)",
+        output_dir, len(tensors), manifest["num_stored_parameters"] / 1e6,
+    )
+    return output_dir
+
+
+def _write_metadata(model, tokenizer, output_dir: Path, manifest: dict, experiment_config: dict, readme) -> None:
     model.config.save_pretrained(output_dir)
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.save_pretrained(output_dir)
@@ -170,9 +200,35 @@ def save_pruned_model(
     write_json(output_dir / MANIFEST_NAME, manifest)
     write_json(output_dir / EXPERIMENT_CONFIG_NAME, experiment_config)
     (output_dir / "README.md").write_text(readme or _default_readme(manifest), encoding="utf-8")
+
+
+def _save_delta(model, tokenizer, output_dir: Path, manifest: dict, experiment_config: dict, readme) -> Path:
+    state = model.state_dict()
+    keys = expected_bias_keys(manifest)
+    missing = [k for k in keys if k not in state]
+    if missing:
+        raise CheckpointError(f"Bias parameters missing from the model: {missing}")
+    tensors = {k: state[k].detach().contiguous().cpu() for k in keys}
+    manifest = {
+        **manifest,
+        "format": FORMAT_NAME,
+        "format_version": FORMAT_VERSION,
+        "checkpoint_format": "delta",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "base_model": {
+            "source": manifest.get("model_source"),
+            "revision": manifest.get("hf_revision"),
+            "dtype": str(next(model.parameters()).dtype).replace("torch.", ""),
+        },
+        "num_stored_tensors": len(tensors),
+        "num_stored_parameters": int(sum(t.numel() for t in tensors.values())),
+    }
+    save_file(tensors, str(output_dir / DELTA_WEIGHTS_NAME),
+              metadata={"format": "pt", "pruning_format": FORMAT_NAME, "checkpoint_format": "delta"})
+    _write_metadata(model, tokenizer, output_dir, manifest, experiment_config, readme)
     logger.info(
-        "Saved pruned checkpoint to %s (%d tensors, %.1fM parameters)",
-        output_dir, len(tensors), manifest["num_stored_parameters"] / 1e6,
+        "Saved delta checkpoint to %s (%d bias tensors, %.3fM parameters; base model %s)",
+        output_dir, len(tensors), manifest["num_stored_parameters"] / 1e6, manifest["base_model"]["source"],
     )
     return output_dir
 
@@ -194,6 +250,10 @@ def _default_readme(manifest: dict) -> str:
         "model, tokenizer, manifest = load_pruned_model('<this directory>', device='cpu')",
         "```",
         "",
+        f"Checkpoint format: `{manifest.get('checkpoint_format', 'full')}`"
+        + (f" (rebuilt from base model `{manifest['base_model']['source']}`)"
+           if manifest.get("checkpoint_format") == "delta" else ""),
+        "",
         "## Replaced experts",
         "",
     ]
@@ -202,20 +262,35 @@ def _default_readme(manifest: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"):
+def load_pruned_model(
+    model_path: Path | str,
+    device: torch.device | str = "cpu",
+    placement: ModelPlacement | None = None,
+    base_model_source: str | None = None,
+    load_kwargs: dict | None = None,
+):
     """Rebuild a pruned model from a checkpoint written by :func:`save_pruned_model`.
 
+    Args:
+        device: target device (ignored when ``placement`` is given).
+        placement: single device or multi-GPU device map (see ``model.placement``).
+        base_model_source: delta checkpoints only - local path / Hub id of the base
+            model, overriding the one recorded in the manifest (e.g. another mount path).
+        load_kwargs: extra ``from_pretrained`` kwargs for the base model (cache_dir, ...).
+
     Returns:
-        (model in eval mode on ``device``, tokenizer, manifest)
+        (model in eval mode, tokenizer, manifest)
     """
     model_path = Path(model_path)
-    device = torch.device(device)
+    placement = placement or ModelPlacement(torch.device(device))
     manifest_path = model_path / MANIFEST_NAME
     if not manifest_path.exists():
         raise CheckpointError(f"{model_path} has no {MANIFEST_NAME}; not a pruned checkpoint")
     manifest = read_json(manifest_path)
     if manifest.get("format") != FORMAT_NAME or manifest.get("format_version") != FORMAT_VERSION:
         raise CheckpointError(f"Unsupported checkpoint format {manifest.get('format')} v{manifest.get('format_version')}")
+    if manifest.get("checkpoint_format", "full") == "delta":
+        return _load_delta(model_path, manifest, placement, base_model_source, load_kwargs or {})
 
     # 1. Architecture from the saved configuration, without allocating weights.
     config = AutoConfig.from_pretrained(model_path)
@@ -268,7 +343,7 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
     if leftover_meta:
         raise CheckpointError(f"Tensors were not materialised: {leftover_meta[:10]}")
 
-    model.to(device)
+    model = place_model(model, placement)
     model.eval()
     adapter.validate_loaded(model, [layers[layer_id] for layer_id in manifest["layers"]])
     for layer_id, entry in manifest["layers"].items():
@@ -277,6 +352,55 @@ def load_pruned_model(model_path: Path | str, device: torch.device | str = "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     logger.info(
         "Loaded pruned checkpoint %s (%d replaced experts) on %s",
-        model_path, sum(len(v["expert_ids"]) for v in manifest["layers"].values()), device,
+        model_path, sum(len(v["expert_ids"]) for v in manifest["layers"].values()), placement.describe(),
+    )
+    return model, tokenizer, manifest
+
+
+def _load_delta(model_path: Path, manifest: dict, placement: ModelPlacement, base_source, load_kwargs: dict):
+    """Base model + re-applied replacement + stored biases."""
+    from moe_pruning.utils.device import resolve_dtype
+
+    base = manifest["base_model"]
+    source = base_source or base["source"]
+    config = AutoConfig.from_pretrained(model_path)
+    plugin = get_plugin(config.model_type)
+    kwargs = {"revision": base.get("revision"), **load_kwargs}
+    logger.info("Delta checkpoint: loading base model %s (%s)", source, base["dtype"])
+    model = plugin.auto_model_class.from_pretrained(
+        source, dtype=resolve_dtype(base["dtype"]), **kwargs, **from_pretrained_kwargs(placement)
+    )
+    if model.config.model_type != config.model_type:
+        raise CheckpointError(f"Base model {source} is {model.config.model_type}, checkpoint is {config.model_type}")
+    if not placement.sharded:
+        model.to(placement.device)
+    model.eval()
+
+    tensors = load_file(str(model_path / DELTA_WEIGHTS_NAME), device="cpu")
+    expected = set(expected_bias_keys(manifest))
+    if set(tensors) != expected:
+        raise CheckpointError(
+            f"Delta tensors mismatch: missing {sorted(expected - set(tensors))[:10]}, "
+            f"unexpected {sorted(set(tensors) - expected)[:10]}"
+        )
+    adapter = get_adapter(model)
+    layers = {layer.layer_id: layer for layer in adapter.discover_layers(model)}
+    for layer_id, entry in manifest["layers"].items():
+        if layer_id not in layers:
+            raise CheckpointError(f"Manifest layer {layer_id} not found in the base model")
+        layer = layers[layer_id]
+        method = layer_method(entry)
+        for expert_id in entry["expert_ids"]:
+            if adapter.expert_state_prefix(layer, expert_id) != entry["expert_state_prefixes"][str(expert_id)]:
+                raise CheckpointError(f"State prefix mismatch for {layer_id} expert {expert_id}")
+        biases = None
+        if method == "bias":
+            biases = {layer_id: {e: tensors[entry["expert_state_prefixes"][str(e)] + "bias"] for e in entry["expert_ids"]}}
+        replace_experts(model, adapter, layers, {layer_id: entry["expert_ids"]}, method, biases)
+    adapter.validate_loaded(model, [layers[layer_id] for layer_id in manifest["layers"]])
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    logger.info(
+        "Rebuilt delta checkpoint %s (%d replaced experts) on %s",
+        model_path, sum(len(v["expert_ids"]) for v in manifest["layers"].values()), placement.describe(),
     )
     return model, tokenizer, manifest

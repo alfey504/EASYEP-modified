@@ -28,6 +28,8 @@ VALID_BIAS_INITIALIZATIONS = ("gate_token_weighted_mean",)
 VALID_TRAINING_OBJECTIVES = ("layer_mse",)
 VALID_UNOBSERVED_POLICIES = ("exclude", "allow")
 VALID_REPLACEMENT_METHODS = ("bias", "drop", "reroute")
+VALID_CHECKPOINT_FORMATS = ("full", "delta")
+VALID_EXPERTS_IMPLEMENTATIONS = ("", "eager", "grouped_mm", "batched_mm")
 
 
 class ConfigError(ValueError):
@@ -46,8 +48,12 @@ class ExperimentConfig:
     hf_revision: str | None
     model_dtype: str
     model_plugins: tuple[str, ...]
+    hf_cache_dir: Path | None
+    experts_implementation: str
     # Device
     device: str
+    device_map: str
+    max_memory: str
     # Datasets
     calibration_dataset_path: Path
     evaluation_dataset_path: Path
@@ -94,6 +100,7 @@ class ExperimentConfig:
     # Outputs
     experiment_name: str
     pruned_model_path: Path
+    checkpoint_format: str
     experiment_dir: Path
     stats_dir: Path
     cache_dir: Path
@@ -262,7 +269,11 @@ def load_config(
         hf_revision=revision,
         model_dtype=r.choice("MODEL_DTYPE", VALID_DTYPES, "float32"),
         model_plugins=_split_csv(r.str("MODEL_PLUGINS", "", required=False)),
+        hf_cache_dir=r.path("HF_CACHE_DIR") if r.str("HF_CACHE_DIR", "", required=False) else None,
+        experts_implementation=r.choice("EXPERTS_IMPLEMENTATION", VALID_EXPERTS_IMPLEMENTATIONS, ""),
         device=r.choice("DEVICE", VALID_DEVICES, "auto"),
+        device_map=r.str("DEVICE_MAP", "", required=False),
+        max_memory=r.str("MAX_MEMORY", "", required=False),
         calibration_dataset_path=r.path("CALIBRATION_DATASET_PATH", "./data/calibration.jsonl"),
         evaluation_dataset_path=r.path(
             "EVALUATION_DATASET_PATH", "./data/evaluation/c4_support_eval.jsonl"
@@ -314,6 +325,7 @@ def load_config(
         seed=r.int("SEED", 42),
         experiment_name=r.str("EXPERIMENT_NAME", "default"),
         pruned_model_path=r.path("PRUNED_MODEL_PATH", "./outputs/pruned-model"),
+        checkpoint_format=r.choice("CHECKPOINT_FORMAT", VALID_CHECKPOINT_FORMATS, "full"),
         experiment_dir=r.path("EXPERIMENT_DIR", "./outputs/experiments"),
         stats_dir=r.path("STATS_DIR", "./outputs/stats"),
         cache_dir=r.path("CACHE_DIR", "./outputs/cache"),
@@ -337,6 +349,14 @@ def load_config(
             )
         elif not (local / "config.json").exists():
             r.errors.append(f"MODEL_PATH={cfg.model_path!r} does not contain a config.json")
+
+    from moe_pruning.model.placement import parse_device_map, parse_max_memory
+
+    for key, parse in (("DEVICE_MAP", parse_device_map), ("MAX_MEMORY", parse_max_memory)):
+        try:
+            parse(values.get(key, ""))
+        except ValueError as exc:
+            r.errors.append(str(exc))
 
     if r.errors:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(r.errors))

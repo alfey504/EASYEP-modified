@@ -66,3 +66,20 @@ def gate_consistency_tolerance(dtype: torch.dtype) -> float:
     if dtype in (torch.float16, torch.bfloat16):
         return 3e-2
     return 1e-4
+
+
+class NonFiniteError(FloatingPointError):
+    pass
+
+
+def assert_finite(tensor: torch.Tensor, what: str, dtype: torch.dtype | None = None) -> None:
+    """Raise a clear error on inf/NaN (typical for float16 overflow, e.g. bf16-trained models on T4)."""
+    if torch.isfinite(tensor).all():
+        return
+    hint = ""
+    if dtype == torch.float16:
+        hint = (
+            " The model runs in float16, whose range (max 65504) is much smaller than bfloat16; models "
+            "trained in bfloat16 can overflow. Use MODEL_DTYPE=bfloat16 on GPUs that support it, or float32."
+        )
+    raise NonFiniteError(f"Non-finite values (inf/NaN) in {what}.{hint}")

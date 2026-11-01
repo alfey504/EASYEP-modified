@@ -13,7 +13,12 @@ import torch
 
 from moe_pruning.data.calibration import CalibrationRecord
 from moe_pruning.model.architecture import get_adapter
-from moe_pruning.model.instrumentation import RecordCollector, gate_consistency_error, gate_consistency_tolerance
+from moe_pruning.model.instrumentation import (
+    RecordCollector,
+    assert_finite,
+    gate_consistency_error,
+    gate_consistency_tolerance,
+)
 from moe_pruning.model.loader import load_original_model
 from moe_pruning.utils.cli import bootstrap
 from moe_pruning.utils.paths import write_json
@@ -40,7 +45,8 @@ def main() -> None:
     batch = task.collate(pair, tok.pad_token_id)
     collector = RecordCollector()
     with torch.no_grad(), adapter.instrument(model, layers, collector):
-        model(**batch.model_inputs(device))
+        logits = model(**batch.model_inputs(device)).logits
+    assert_finite(logits, "probe logits", loaded.dtype)
 
     probe = {}
     for layer_id, records in collector.by_layer().items():
@@ -65,6 +71,7 @@ def main() -> None:
         "max_rel_error": max_err,
     }
     report["model_source"] = loaded.source
+    report["placement"] = {str(k): str(v) for k, v in getattr(model, "hf_device_map", {}).items()} or str(device)
     report["model_plugin"] = loaded.plugin.name
     report["task"] = task.name
     report["revision"] = loaded.revision

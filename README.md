@@ -14,7 +14,7 @@ Supported models (each is a separate plugin, see [Model plugins](#model-plugins)
 | `switch_transformers` | `google/switch-base-8` | encoder–decoder, 12 MoE layers × 8 experts, top-1, capacity 64 | `configs/switch-base-8.env` |
 | `olmoe` | `allenai/OLMoE-1B-7B-0125` (the model used in STEP) | decoder-only, 16 MoE layers × 64 experts, top-8 | `configs/olmoe-1b-7b-0125.env` |
 
-switch-base-8 runs on an Apple-silicon Mac (MPS, 16 GB). OLMoE-1B-7B (6.9B parameters, ~14 GB in bfloat16) needs a GPU with ≥ 24 GB.
+switch-base-8 runs on an Apple-silicon Mac (MPS, 16 GB). OLMoE-1B-7B (6.9B parameters, ~14 GB in 16-bit) needs ≥ 24 GB of GPU memory. It can be split over **Kaggle's 2× T4** (see [Running on Kaggle](#running-on-kaggle-gpu-t4-x2)).
 
 See [docs/sample_experiment_report.md](docs/sample_experiment_report.md) for results of a first run.
 
@@ -23,9 +23,11 @@ See [docs/sample_experiment_report.md](docs/sample_experiment_report.md) for res
 ## Installation
 
 ```bash
-uv sync                 # Python 3.14, torch, transformers, datasets, safetensors, ...
+uv sync                 # Python >= 3.10, torch, transformers 5, accelerate, datasets, safetensors, ...
 cp .env.example .env    # then edit .env
 ```
+
+On hosted notebooks (Kaggle, Colab) use `pip install -e .`, which reuses the preinstalled CUDA build of torch. Tested with Python 3.10 (torch 2.14, transformers 5.20) and Python 3.14 (torch 2.15, transformers 5.22).
 
 Put your calibration data at `CALIBRATION_DATASET_PATH` (default `./data/calibration.jsonl`), one JSON object per line:
 
@@ -270,6 +272,10 @@ The loader builds the architecture from `config.json` on the meta device, instal
 | `MODEL_DTYPE` | `float32` (default, recommended on MPS), `float16`, `bfloat16` (OLMoE profile). |
 | `MODEL_PLUGINS` | Extra plugin modules to import (comma-separated); built-in plugins are always available. |
 | `DEVICE` | `auto` (CUDA → MPS → CPU) or explicit `cuda`/`mps`/`cpu`. An unavailable explicit device is an error. |
+| `DEVICE_MAP` | Empty = whole model on `DEVICE`. `auto`, `balanced`, `balanced_low_0`, `sequential` or a JSON object = split over several GPUs with accelerate. |
+| `MAX_MEMORY` | Per-device cap for `DEVICE_MAP`, e.g. `0:13GiB,1:13GiB` (leaves room for activations). |
+| `HF_CACHE_DIR` | Download cache for Hugging Face models (empty = default). |
+| `EXPERTS_IMPLEMENTATION` | transformers 5 experts kernel for fused-expert models (empty = default; `eager`, `grouped_mm`, `batched_mm`). |
 | `CALIBRATION_DATASET_PATH` | JSONL with `human`/`response`. |
 | `EVALUATION_DATASET_PATH` | Output of the C4 builder / input of evaluation. |
 | `CALIBRATION_MAX_SAMPLES`, `CALIBRATION_BATCH_SIZE` | Calibration size and batch size. |
@@ -297,11 +303,12 @@ The loader builds the architecture from `config.json` on the meta device, instal
 | `EXPERIMENT_NAME` | Sub-directory for all artifacts of one experiment. |
 | `PRUNED_MODEL_PATH`, `EXPERIMENT_DIR`, `STATS_DIR`, `CACHE_DIR` | Output locations. |
 | `LOG_LEVEL` | Python logging level. |
+| `CHECKPOINT_FORMAT` | `full` = self-contained checkpoints; `delta` = only bias vectors + manifest, rebuilt from the base model on load. |
 
 ## Tests
 
 ```bash
-uv run pytest            # 105 tests; unit tests use tiny random Switch and OLMoE models on CPU
+uv run pytest            # 122 tests; unit tests use tiny random Switch and OLMoE models on CPU
 uv run pytest -m integration   # tests on the real google/switch-base-8 (skipped if not cached)
 ```
 
@@ -319,6 +326,7 @@ They cover:
 - **Evaluation:** the reference probe matches the true layer error for every method.
 - **OLMoE:** discovery, top-k instrumentation, expert views versus the raw weights, original experts loaded from both the hub and fused layouts, causal tokenization and loss, top-k statistics with padding, fused-expert compaction for bias/drop/reroute, repeated compaction, checkpoint round trips (compact tensor shapes, routing mask restored), the exact probe, and bias training.
 - **Plugins:** built-in discovery, loading an external plugin module, conflict detection, profile layering.
+- **Placement and Kaggle support:** a model split over two real devices (CPU + accelerator, with accelerate-style input hooks): forward pass, instrumentation, replacement modules on each layer's device, the probe, labels on the logits' device, and bias training on the layer's device. Also: accelerate dispatch, delta checkpoint round trips for both models and all methods, base-model mismatch detection, float16 overflow errors, and parsing of the placement settings and Kaggle profiles.
 
 ## Reproducibility notes
 
@@ -353,3 +361,26 @@ Notes:
 * Set `BIAS_LEARNING_RATE` relative to the bias magnitudes (`bias_norm` in `bias_initialization.json`): Adam moves each coordinate by about the learning rate per step.
 * The evaluation probe reads the removed experts' original weights lazily from the downloaded shards, so it needs no second model copy.
 * `PrunedFusedExperts` loops over the routed experts in Python, as transformers' eager experts implementation does. It is correct but slower than `grouped_mm`.
+
+## Running on Kaggle (GPU T4 x2)
+
+Use the notebook [`kaggle/easyep_kaggle.ipynb`](kaggle/easyep_kaggle.ipynb) (branch `kaggle_adapted`) and the profiles in `configs/kaggle/`:
+
+| Profile | Model | Precision | Placement |
+|---|---|---|---|
+| `configs/kaggle/olmoe-1b-7b-t4x2.env` | OLMoE-1B-7B-0125 | float16 | `DEVICE_MAP=auto`, 13 GiB per T4 |
+| `configs/kaggle/switch-base-8-t4.env` | switch-base-8 | float32 | one T4 |
+
+How the Kaggle limits are handled:
+
+* **2 × 15 GB GPUs:** `DEVICE_MAP=auto` places the decoder layers on both T4s with accelerate. Every stage follows each layer's device: replacement modules, reference experts and bias training run on the GPU that holds the layer, inputs go to the embedding's GPU, and labels go to the logits' GPU.
+* **No bfloat16 on T4:** the OLMoE profile uses float16. OLMoE was trained in bfloat16, so inf/NaN are checked during inspection, statistics and evaluation, with an error explaining the cause. switch-base-8 stays in float32, because T5-family models overflow in float16.
+* **20 GB `/kaggle/working`:**
+  * The Hugging Face download goes to `/kaggle/temp/hf`.
+  * The layer-reference cache goes to `/kaggle/temp/cache`, stored in the model's 16-bit dtype.
+  * `CHECKPOINT_FORMAT=delta` saves only the bias vectors and the manifest per stage: a few MB instead of 14 GB. A delta checkpoint is rebuilt by loading the base model and re-applying the recorded replacement.
+  * `scripts/convert_model.py` writes a 14 GB float16 copy of OLMoE once. Saved as a Kaggle Dataset and used through `MODEL_PATH`, it avoids the 28 GB float32 download in later sessions.
+* **12 h sessions:** each stage writes its results under `/kaggle/working/outputs`, so a new session can continue from the last finished stage. Re-attach the same inputs and settings.
+* **Private repository:** clone with a GitHub token stored as a Kaggle Secret, e.g. `from kaggle_secrets import UserSecretsClient; token = UserSecretsClient().get_secret("GITHUB_TOKEN")`, and `https://{token}@github.com/...`.
+
+Not yet run on real Kaggle hardware. The multi-device code paths are tested by splitting a tiny OLMoE over CPU + MPS. The float16 + accelerate + delta-checkpoint pipeline was run end to end on a tiny OLMoE. If float16 overflows on the real OLMoE, the alternatives are a GPU with bfloat16 support (A100/L4) or float32 on larger GPUs.

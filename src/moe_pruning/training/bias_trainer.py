@@ -35,6 +35,7 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 from moe_pruning.model.architecture import MoEAdapter, MoELayerInfo
+from moe_pruning.model.placement import module_device
 from moe_pruning.pruning.bias_expert import BiasExpert
 from moe_pruning.utils.paths import read_json, write_json
 
@@ -112,8 +113,10 @@ def capture_layer_references(
             # Right padding: real tokens are the prefix of the row.
             if not bool(mask[row, :n].all()):
                 raise RuntimeError("Expected right-padded sequences")
-            store[rec.layer_id]["x"].append(rec.moe_input[row, :n].float().cpu())
-            store[rec.layer_id]["y"].append(rec.moe_output[row, :n].float().cpu())
+            # Half-precision models are cached in their own dtype (halves disk use).
+            dtype = rec.moe_input.dtype if rec.moe_input.dtype in (torch.float16, torch.bfloat16) else torch.float32
+            store[rec.layer_id]["x"].append(rec.moe_input[row, :n].to(dtype).cpu())
+            store[rec.layer_id]["y"].append(rec.moe_output[row, :n].to(dtype).cpu())
             store[rec.layer_id]["ids"].append(eid)
 
     with adapter.instrument(model, layers, on_record):
@@ -143,7 +146,7 @@ def masked_sequence_batch(
     max_len = max(x.shape[0] for x, _ in seqs)
     dim = ref.inputs.shape[1]
     x = torch.zeros(len(rows), max_len, dim, dtype=dtype)
-    y = torch.zeros(len(rows), max_len, dim, dtype=torch.float32)
+    y = torch.zeros(len(rows), max_len, dim, dtype=torch.float32)  # loss in float32
     mask = torch.zeros(len(rows), max_len, dtype=torch.bool)
     for i, (xi, yi) in enumerate(seqs):
         n = xi.shape[0]
@@ -254,8 +257,13 @@ def train_layer_biases(
     eval_interval: int,
     seed: int,
 ) -> LayerTrainingResult:
-    """Optimise all BiasExpert biases of one layer jointly with Adam."""
+    """Optimise all BiasExpert biases of one layer jointly with Adam.
+
+    Runs on the layer's own device (``device`` is ignored when the model is
+    sharded over several GPUs).
+    """
     start_time = time.perf_counter()
+    device = module_device(adapter.get_moe_module(model, layer))
     model.eval()  # no dropout: the reference was produced in eval mode
     experts = _layer_biases(model, adapter, layer, expert_ids)
     params = [m.bias for m in experts.values()]

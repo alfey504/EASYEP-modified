@@ -13,6 +13,8 @@ from moe_pruning.config import ExperimentConfig
 from moe_pruning.data.c4_support import load_eval_documents
 from moe_pruning.evaluation.metrics import summarize_losses
 from moe_pruning.model.architecture import MoEAdapter, MoEForwardRecord, MoELayerInfo
+from moe_pruning.model.instrumentation import assert_finite
+from moe_pruning.model.placement import module_device
 from moe_pruning.tasks.base import TaskObjective
 from moe_pruning.utils.paths import ArtifactPaths, file_sha256, fingerprint
 
@@ -151,9 +153,10 @@ def build_reference_probe(
     reference: dict[str, dict[int, nn.Module]] = {}
     dtype = next(model.parameters()).dtype
     for layer_id, expert_ids in replaced.items():
+        layer_device = module_device(adapter.get_router(model, layers[layer_id]))  # per-layer GPU when sharded
         for e in expert_ids:
             module = adapter.load_original_expert(reader, model, layers[layer_id], e)
-            reference.setdefault(layer_id, {})[e] = module.to(device=device, dtype=dtype).eval()
+            reference.setdefault(layer_id, {})[e] = module.to(device=layer_device, dtype=dtype).eval()
     return ReferenceExpertProbe(model, adapter, layers, reference)
 
 
@@ -197,6 +200,7 @@ def evaluate_model(
             current["masks"] = batch.token_masks(device)
             inputs = batch.model_inputs(device)
             logits = model(**inputs).logits
+            assert_finite(logits, "logits", next(model.parameters()).dtype)
             loss_sum, n_tok = task.token_nll(logits, inputs["labels"])
             batch_preds = task.predictions(logits, inputs["labels"])
             for row, eid in enumerate(batch.example_ids):
